@@ -72,7 +72,7 @@ using namespace time_literals;
 static constexpr char sensor_name[] {"mag"};
 static constexpr int MAX_MAGS = 4;
 static constexpr float MAG_SPHERE_RADIUS_DEFAULT = 0.2f;
-static constexpr unsigned int calibration_total_points = 240;	///< The total points per magnetometer
+static constexpr unsigned int calibration_total_points = 600;	///< The total points per magnetometer
 static constexpr unsigned int calibraton_duration_s = 42; 	///< The total duration the routine is allowed to take
 
 calibrate_return mag_calibrate_all(orb_advert_t *mavlink_log_pub, int32_t cal_mask);
@@ -587,10 +587,32 @@ calibrate_return mag_calibrate_all(orb_advert_t *mavlink_log_pub, int32_t cal_ma
 				sphere_data.diag = matrix::Vector3f(diag[cur_mag](0), diag[cur_mag](1), diag[cur_mag](2));
 				sphere_data.offdiag = matrix::Vector3f(offdiag[cur_mag](0), offdiag[cur_mag](1), offdiag[cur_mag](2));
 
-				bool sphere_fit_success = false;
-				bool ellipsoid_fit_success = false;
-				int ret = lm_mag_fit(worker_data.x[cur_mag], worker_data.y[cur_mag], worker_data.z[cur_mag],
-						     worker_data.calibration_counter_total[cur_mag], sphere_data, false);
+				// DEBUG: print mag data summary before fit
+			{
+				unsigned n = worker_data.calibration_counter_total[cur_mag];
+				float xmin=0,xmax=0,ymin=0,ymax=0,zmin=0,zmax=0;
+				if (n > 0) {
+					xmin=xmax=worker_data.x[cur_mag][0];
+					ymin=ymax=worker_data.y[cur_mag][0];
+					zmin=zmax=worker_data.z[cur_mag][0];
+					for (unsigned i=1; i<n; i++) {
+						if (worker_data.x[cur_mag][i] < xmin) xmin = worker_data.x[cur_mag][i];
+						if (worker_data.x[cur_mag][i] > xmax) xmax = worker_data.x[cur_mag][i];
+						if (worker_data.y[cur_mag][i] < ymin) ymin = worker_data.y[cur_mag][i];
+						if (worker_data.y[cur_mag][i] > ymax) ymax = worker_data.y[cur_mag][i];
+						if (worker_data.z[cur_mag][i] < zmin) zmin = worker_data.z[cur_mag][i];
+						if (worker_data.z[cur_mag][i] > zmax) zmax = worker_data.z[cur_mag][i];
+					}
+				}
+				calibration_log_info(mavlink_log_pub,
+					"[cal] mag[%d] samples=%u X[%.0f,%.0f] Y[%.0f,%.0f] Z[%.0f,%.0f]",
+					cur_mag, n, (double)xmin,(double)xmax, (double)ymin,(double)ymax, (double)zmin,(double)zmax);
+			}
+
+			bool sphere_fit_success = false;
+			bool ellipsoid_fit_success = false;
+			int ret = lm_mag_fit(worker_data.x[cur_mag], worker_data.y[cur_mag], worker_data.z[cur_mag],
+					     worker_data.calibration_counter_total[cur_mag], sphere_data, false);
 
 				if (ret == PX4_OK) {
 					sphere_fit_success = true;

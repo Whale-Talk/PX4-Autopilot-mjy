@@ -1,0 +1,27 @@
+#!/bin/sh
+#
+# RK3506 Lyra board sensor init
+#------------------------------------------------------------------------------
+
+# Internal SPI bus sensors
+bmi088 -A -R 12 -s start
+bmi088 -G -R 12 -s start
+icm42688p -R 6 -s start
+
+# External SPI (optional)
+# icm20602 -S -b 1 -R 0 start
+
+# Magnetometer QMC5883P on I2C1 (internal bus, addr 0x2C)
+qmc5883p -I -b 1 -R 12 start
+
+# Barometers on I2C0 (same bus, different addresses)
+if param compare SENS_INT_BARO_EN 1
+then
+	bmp388 -I -b 0 -a 0x77 start
+fi
+bmp388 -X -b 0 -a 0x76 start
+
+# UAVCAN over SocketCAN
+uavcan start
+
+exit 0

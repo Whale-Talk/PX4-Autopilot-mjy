@@ -219,6 +219,16 @@ static calibrate_return accel_calibration_worker(detect_orientation_return orien
 
 	read_accelerometer_avg(worker_data, orientation, samples_num);
 
+	// DEBUG: print all accel values before axis check
+	for (unsigned di = 0; di < MAX_ACCEL_SENS; di++) {
+		calibration_log_info(worker_data->mavlink_log_pub,
+			"[cal] accel[%d] %s: [%.3f %.3f %.3f]",
+			di, detect_orientation_str(orientation),
+			(double)worker_data->accel_ref[di][orientation][0],
+			(double)worker_data->accel_ref[di][orientation][1],
+			(double)worker_data->accel_ref[di][orientation][2]);
+	}
+
 	// check accel
 	for (unsigned accel_index = 0; accel_index < MAX_ACCEL_SENS; accel_index++) {
 		switch (orientation) {

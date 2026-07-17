@@ -745,6 +745,9 @@ void ICM42688P::ProcessAccel(const hrt_abstime &timestamp_sample, const FIFO::DA
 		accel.x[i] = accel.x[i];
 		accel.y[i] = (accel.y[i] == INT16_MIN) ? INT16_MAX : -accel.y[i];
 		accel.z[i] = (accel.z[i] == INT16_MIN) ? INT16_MAX : -accel.z[i];
+
+	static int dbg = 0;
+	if (++dbg == 1000 && accel.samples > 0) { PX4_ERR("ICM42688P raw: x=%d y=%d z=%d", accel.x[0], accel.y[0], accel.z[0]); }
 	}
 
 	_px4_accel.set_error_count(perf_event_count(_bad_register_perf) + perf_event_count(_bad_transfer_perf) +
