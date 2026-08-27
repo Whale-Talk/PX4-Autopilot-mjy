@@ -1,0 +1,6 @@
+module_name: DETA40 FDILink IMU/GNSS Driver
+serial_config:
+    - command: deta40 start ${SERIAL_DEV}
+      port_config_param:
+        name: SENS_DETA40_CFG
+        group: Sensors

@@ -1,0 +1,5 @@
+menuconfig DRIVERS_INS_DETA40
+	bool "DETA40 FDILink IMU/GNSS"
+	default n
+	---help---
+		Enable DETA40 FDILink IMU/GNSS driver (UART binary protocol @ 921600bps)
