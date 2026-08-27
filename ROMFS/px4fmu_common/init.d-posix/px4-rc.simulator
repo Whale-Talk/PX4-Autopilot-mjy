@@ -1,16 +1,6 @@
 #!/bin/sh
 # shellcheck disable=SC2154
 
-# Real hardware mode (no simulator)
-if [ "$PX4_SIMULATOR" = "none" ] || [ "$PX4_SIMULATOR" = "realhw" ]; then
-    echo "INFO  [init] Real hardware mode, skipping simulator"
-    # Board-specific sensor startup
-    if [ -f ${R}etc/init.d/rc.board_sensors ]; then
-        . ${R}etc/init.d/rc.board_sensors
-    fi
-    exit 0
-fi
-
 # Simulator IMU data provided at 250 Hz
 param set-default IMU_INTEG_RATE 250
 
