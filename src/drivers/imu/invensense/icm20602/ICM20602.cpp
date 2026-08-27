@@ -639,9 +639,6 @@ bool ICM20602::ProcessAccel(const hrt_abstime &timestamp_sample, const FIFO::DAT
 		accel.x[accel.samples] = accel_x;
 		accel.y[accel.samples] = (accel_y == INT16_MIN) ? INT16_MAX : -accel_y;
 		accel.z[accel.samples] = (accel_z == INT16_MIN) ? INT16_MAX : -accel_z;
-
-			static int dbg = 0;
-			if (++dbg == 1000) { PX4_ERR("ICM20602 raw: x=%d y=%d z=%d  flipped: x=%d y=%d z=%d", accel_x,accel_y,accel_z, accel_x,-accel_y,-accel_z); }
 		accel.samples++;
 	}
 

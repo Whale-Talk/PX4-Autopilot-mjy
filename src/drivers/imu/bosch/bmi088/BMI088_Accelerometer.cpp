@@ -519,14 +519,6 @@ bool BMI088_Accelerometer::FIFORead(const hrt_abstime &timestamp_sample, uint8_t
 				accel.z[accel.samples] = (accel_z == INT16_MIN) ? INT16_MAX : -accel_z;
 				accel.samples++;
 
-				// DEBUG
-				static int debug_count = 0;
-				if (++debug_count == 1000) {
-					PX4_ERR("BMI088 raw: x=%d y=%d z=%d  flipped: x=%d y=%d z=%d\n",
-						accel_x, accel_y, accel_z,
-						accel_x, -accel_y, -accel_z);
-				}
-
 				fifo_buffer_index += 7; // move forward to next record
 			}
 			break;
