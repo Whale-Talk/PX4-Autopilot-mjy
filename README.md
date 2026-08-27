@@ -1,62 +1,70 @@
-# PX4 Drone Autopilot
+# PX4 Autopilot — SEEEX25D H1 飞控定制版
 
-[![Releases](https://img.shields.io/github/release/PX4/PX4-Autopilot.svg)](https://github.com/PX4/PX4-Autopilot/releases) [![DOI](https://zenodo.org/badge/22634/PX4/PX4-Autopilot.svg)](https://zenodo.org/badge/latestdoi/22634/PX4/PX4-Autopilot)
+本仓库是 [PX4 Autopilot](https://github.com/PX4/PX4-Autopilot) 的定制分叉（fork），基于 **PX4 v1.16.1**（上游基线提交 `94cb201279`，2025-11-10）派生，服务于 **SEEEX25D H1 飞控**（定制版 FMUv6x，STM32H743 + NuttX）。
 
-[![Build Targets](https://github.com/PX4/PX4-Autopilot/actions/workflows/build_all_targets.yml/badge.svg?branch=main)](https://github.com/PX4/PX4-Autopilot/actions/workflows/build_all_targets.yml) [![SITL Tests](https://github.com/PX4/PX4-Autopilot/workflows/SITL%20Tests/badge.svg?branch=master)](https://github.com/PX4/PX4-Autopilot/actions?query=workflow%3A%22SITL+Tests%22)
+> **状态：已打板，实际飞行验证通过** ✅
+>
+> H1 飞控已完成 PCB 打板、固件烧录与真实飞行验证（传感器组合、SBUS 遥控链路、PX4IO 协处理器均已在硬件上验证）。
 
-[![Discord Shield](https://discordapp.com/api/guilds/1022170275984457759/widget.png?style=shield)](https://discord.gg/dronecode)
+## 关于 H1 飞控（fmu-v6x_seeex25d）
 
-This repository holds the [PX4](http://px4.io) flight control solution for drones, with the main applications located in the [src/modules](https://github.com/PX4/PX4-Autopilot/tree/main/src/modules) directory. It also contains the PX4 Drone Middleware Platform, which provides drivers and middleware to run drones.
+H1 飞控基于标准 FMUv6x（Pixhawk 6X 架构）定制，硬件型号 SEEEX25D，早期开发代号 mjy，现已统一命名。板级目标：`px4_fmu-v6x_seeex25d_default`。
 
-PX4 is highly portable, OS-independent and supports Linux, NuttX and MacOS out of the box.
+### 定制传感器组合
 
-* Official Website: http://px4.io (License: BSD 3-clause, [LICENSE](https://github.com/PX4/PX4-Autopilot/blob/main/LICENSE))
-* [Supported airframes](https://docs.px4.io/main/en/airframes/airframe_reference.html) ([portfolio](https://px4.io/ecosystem/commercial-systems/)):
-  * [Multicopters](https://docs.px4.io/main/en/frames_multicopter/)
-  * [Fixed wing](https://docs.px4.io/main/en/frames_plane/)
-  * [VTOL](https://docs.px4.io/main/en/frames_vtol/)
-  * [Autogyro](https://docs.px4.io/main/en/frames_autogyro/)
-  * [Rover](https://docs.px4.io/main/en/frames_rover/)
-  * many more experimental types (Blimps, Boats, Submarines, High Altitude Balloons, Spacecraft, etc)
-* Releases: [Downloads](https://github.com/PX4/PX4-Autopilot/releases)
+| 传感器 | 总线 | CS/地址 | 说明 |
+|--------|------|---------|------|
+| BMI088（加速度计）| SPI3 | PI4 | 与陀螺仪分体 |
+| BMI088（陀螺仪）| SPI3 | PI8 | |
+| ICM42688P | SPI2 | PH5 | |
+| ICM20602 | SPI1 | PI9 | 主 IMU |
+| BMP388 #1（内部）| I2C4 | 0x77 | |
+| BMP388 #2（外部）| I2C2 | 0x76 | |
+| QMC5883P | I2C4 | 0x0D | 外部磁力计 |
 
-## Releases
+### 硬件版本检测
 
-Release notes and supporting information for PX4 releases can be found on the [Developer Guide](https://docs.px4.io/main/en/releases/).
+- 版本电阻分压：33.4kΩ（上拉）+ 57.4kΩ（下拉）→ ordinal 7 → `V6X007`（HW FMUM ID 0x7）
 
-## Building a PX4 based drone, rover, boat or robot
+### 架构
 
-The [PX4 User Guide](https://docs.px4.io/main/en/) explains how to assemble [supported vehicles](https://docs.px4.io/main/en/airframes/airframe_reference.html) and fly drones with PX4. See the [forum and chat](https://docs.px4.io/main/en/#getting-help) if you need help!
+- **FMU**：STM32H743（Cortex-M7），运行 NuttX
+- **IO 协处理器**：PX4IO v2（STM32F100），负责 RC 输入与 MAIN PWM 输出，经 USART6（`/dev/ttyS5`，1.5Mbps）与 FMU 通信
+- **RC 输入**：SBUS 经 IO 板硬件反相器进入 IO 板 USART3（PB11）；DSM/Spektrum 走 USART1（PA10）
 
+## 相对上游 PX4 的主要修改
 
-## Changing Code and Contributing
+| 修改 | 位置 | 说明 |
+|------|------|------|
+| **H1 飞控板级** | `boards/px4/fmu-v6x_seeex25d/` | 定制板级：HW 版本检测（V6X007）、独立 SPI/I2C 传感器配置、启动脚本 |
+| **QMC5883P 磁力计驱动** | `src/drivers/magnetometer/qmc5883p/` | 新增驱动（H1 外部磁力计） |
+| **DETA40 INS 驱动** | `src/drivers/ins/deta40/` | 外接 DETA40 IMU/GNSS 模组（FDILink 协议，UART 921600bps）|
+| **磁力计标定点数** | `src/modules/commander/mag_calibration.cpp` | 标定采样点 240 → 600（提高球拟合精度）|
+| **bootloader 更新** | `boards/px4/fmu-v6x/extras/` | 同步升级至 PX4BL v1.16.1（上游仓库仍为 v1.15.0）|
+| 诊断工具 | `_h1_diag/` | H1 飞控 MAVLink 串口诊断/参数工具（零第三方依赖）|
 
-This [Developer Guide](https://docs.px4.io/main/en/development/development.html) is for software developers who want to modify the flight stack and middleware (e.g. to add new flight modes), hardware integrators who want to support new flight controller boards and peripherals, and anyone who wants to get PX4 working on a new (unsupported) airframe/vehicle.
+## 构建
 
-Developers should read the [Guide for Contributions](https://docs.px4.io/main/en/contribute/).
-See the [forum and chat](https://docs.px4.io/main/en/#getting-help) if you need help!
+```bash
+# H1 飞控固件（本仓库主目标）
+make px4_fmu-v6x_seeex25d_default
 
+# 产物
+build/px4_fmu-v6x_seeex25d_default/px4_fmu-v6x_seeex25d_default.px4
+```
 
-## Weekly Dev Call
+构建依赖 arm-none-eabi 工具链（GCC 14.2.1）、CMake、Ninja。板级定制说明见 `boards/px4/fmu-v6x_seeex25d/AGENTS.md`。
 
-The PX4 Dev Team syncs up on a [weekly dev call](https://docs.px4.io/main/en/contribute/).
+## 分支结构
 
-> **Note** The dev call is open to all interested developers (not just the core dev team). This is a great opportunity to meet the team and contribute to the ongoing development of the platform. It includes a QA session for newcomers. All regular calls are listed in the [Dronecode calendar](https://www.dronecode.org/calendar/).
+| 分支 | 内容 |
+|------|------|
+| `seeex25d_H1` | **主开发分支**：H1 飞控（SEEEX25D）全部定制 |
+| `upstream` | 跟踪上游 PX4（基线 `94cb201279`，v1.16.1）|
+| `lyra_dev` | RK3506 Lyra 板（Linux 目标，独立维护）|
 
+## 上游信息
 
-## Maintenance Team
-
-See the latest list of maintainers on [MAINTAINERS](MAINTAINERS.md) file at the root of the project.
-
-For the latest stats on contributors please see the latest stats for the Dronecode ecosystem in our project dashboard under [LFX Insights](https://insights.lfx.linuxfoundation.org/foundation/dronecode). For information on how to update your profile and affiliations please see the following support link on how to [Complete Your LFX Profile](https://docs.linuxfoundation.org/lfx/my-profile/complete-your-lfx-profile). Dronecode publishes a yearly snapshot of contributions and achievements on its [website under the Reports section](https://dronecode.org).
-
-## Supported Hardware
-
-For the most up to date information, please visit [PX4 User Guide > Autopilot Hardware](https://docs.px4.io/main/en/flight_controller/).
-
-## Project Governance
-
-The PX4 Autopilot project including all of its trademarks is hosted under [Dronecode](https://www.dronecode.org/), part of the Linux Foundation.
-
-<a href="https://www.dronecode.org/" style="padding:20px" ><img src="https://dronecode.org/wp-content/uploads/sites/24/2020/08/dronecode_logo_default-1.png" alt="Dronecode Logo" width="110px"/></a>
-<div style="padding:10px">&nbsp;</div>
+- 上游项目：[PX4 Autopilot](https://github.com/PX4/PX4-Autopilot)（BSD 3-clause，见 [LICENSE](LICENSE)）
+- 官方文档：https://docs.px4.io
+- 本定制基于 PX4 v1.16.1（提交 `94cb201279`），飞行栈与中间件沿用上游，未改动核心控制逻辑
