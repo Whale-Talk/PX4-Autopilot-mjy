@@ -1,0 +1,28 @@
+{
+  "source_commit": "9b103208c29f479861b7c7b4d82585584b383692",
+  "source_tag": "v1.16.1-5-g9b103208",
+  "target": "cuav_x7pro_default",
+  "board_id": 1010,
+  "package_git_identity": "v1.16.1-5-g9b103208",
+  "application_flash_capacity": 1966080,
+  "linker_flash_used_bytes": 1915488,
+  "linker_flash_delta_to_baseline_bytes": 728,
+  "linker_flash_remaining_bytes": 50592,
+  "linker_axi_sram_static_bytes": 44712,
+  "linker_sram4_static_bytes": 2048,
+  "artifacts": {
+    "cuav_x7pro_default.elf": {
+      "bytes": 46555208,
+      "sha256": "736c3daa54df29dfeb15709bf11a1bc88aa1947824f2abacbc61381422884cba"
+    },
+    "cuav_x7pro_default.bin": {
+      "bytes": 1915488,
+      "sha256": "1bac8423207cab0bdad198cb1ea46cac40f2aaf9c6f4bcc6ccfff76488020431"
+    },
+    "cuav_x7pro_default.px4": {
+      "bytes": 1778999,
+      "sha256": "769c62406b989c4cc276023e26ae4ecdc25784a9e30869560dfc9d3d4b8caabf"
+    }
+  },
+  "hardware_cpu_and_flight_validation": false
+}

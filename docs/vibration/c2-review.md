@@ -29,3 +29,5 @@ C1 独立代码复核未发现需修复的生产缺陷；架构复核为 WATCH�
 官方 px4_fmu-v6x_default 目标从 C1 源码构建通过，FLASH 1,924,600/1,966,080 B，静态 AXI_SRAM 100,732 B。这是通用平台编译兼容性证据；原 H1 定制目标尚未移植或重新构建本补丁。
 
 X7 实机 CPU、动态内存、写卡长尾、完整传感器链路及飞行对照仍按操作指南执行。C1 正式固件和基线固件已分别归档，见 [c1-build.json](c1-build.json) 与 [baseline-build.json](baseline-build.json)。
+
+最终 C2 提交 9b103208c29f479861b7c7b4d82585584b383692 的 X7 构建也通过，版本头与包身份为 v1.16.1-5-g9b103208。FLASH 与 C1 正式版同为 1,915,488 B，静态 RAM 不变；新增测试未进入固件。最终产物哈希见 [c2-build.json](c2-build.json)，保存在审计目录 c2-committed/。整体采集方案见 [acquisition-plan.md](acquisition-plan.md)。
