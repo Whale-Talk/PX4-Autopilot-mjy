@@ -1,0 +1,18 @@
+{
+  "px4_release": "v1.16.1",
+  "source_commit": "94cb2012792b2ae89f0b147cfee53ee31ae550be",
+  "target": "cuav_x7pro_default",
+  "submodules": {
+    "platforms/nuttx/NuttX/nuttx": "886acbbdb4f061e5c0ce1a76afbcfa7cb7df9849",
+    "platforms/nuttx/NuttX/apps": "e37940d8535f603a16b8f6f21c21edaf584218aa",
+    "src/drivers/gps/devices": "4cea5de87ce7e2a52e5289bd3639fd8eb770eafa",
+    "src/modules/mavlink/mavlink": "5bfd76d80281f6027134e854aafe6cb3dbfbe9e1",
+    "src/modules/mavlink/mavlink/pymavlink": "4960d4d20dcf9fc2981785355567fc5773416bc9",
+    "src/drivers/uavcan/libdronecan/dsdl": "993be80a62ec957c01fb41115b83663959a49f46",
+    "src/drivers/uavcan/libdronecan/libuavcan/dsdl_compiler/pydronecan": "19fdf2e5b383243ccdb1094edae0603cf11469e8",
+    "src/lib/events/libevents": "9ef591c447fe0386d698bf6fb9a6d27e43988ee4",
+    "src/lib/heatshrink/heatshrink": "052e6de72f67f1777198bce98f3de62f7f3c16a0",
+    "src/modules/uxrce_dds_client/Micro-XRCE-DDS-Client": "711aef423edd1820347b866d1e4164832df35d04"
+  },
+  "note": "Fixed parent/nested gitlinks; initialization does not upgrade any source revision. Build environment and successful artifact hashes are recorded separately."
+}
