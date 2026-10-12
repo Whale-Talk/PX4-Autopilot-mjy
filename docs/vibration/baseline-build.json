@@ -1,0 +1,30 @@
+{
+  "source_commit": "94cb2012792b2ae89f0b147cfee53ee31ae550be",
+  "target": "cuav_x7pro_default",
+  "board_id": 1010,
+  "package_git_identity": "v1.16.1",
+  "image_size": 1914760,
+  "application_flash_capacity": 1966080,
+  "linker_flash_used_bytes": 1914760,
+  "linker_flash_remaining_bytes": 51320,
+  "linker_axi_sram_static_bytes": 44712,
+  "linker_sram4_static_bytes": 2048,
+  "toolchain": "Arm GNU Toolchain 13.2.rel1; GCC 13.2.1 20231009",
+  "artifacts": {
+    "cuav_x7pro_default.elf": {
+      "bytes": 46544836,
+      "sha256": "2f3473974d59afe5fe5f7923757ccaa4bb49a1b16977cf833b74c1143298765b"
+    },
+    "cuav_x7pro_default.bin": {
+      "bytes": 1914760,
+      "sha256": "4e8ac89e627887021afe375378590b43512f4f5c50730db54602f23bf1eea389"
+    },
+    "cuav_x7pro_default.px4": {
+      "bytes": 1777983,
+      "sha256": "3447ae69b02bb6de79aca5ccf86c659820bdee1b7d61d4d9d537cd403044544e"
+    }
+  },
+  "microcdr_commit": "3d1b17703c7cf4f22def2910bc845bdb5152d7b5",
+  "nuttx_metadata_reference": "nuttx-11.0.0 (historical label; not a source checkout or ancestry claim)",
+  "build_exit_code": 0
+}
