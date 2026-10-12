@@ -109,3 +109,7 @@ src/systemcmds/topic_listener/listener_generated.cpp
 # colcon
 log/
 keys/
+
+# Local vibration research and planning documents
+/docs/vibration/*.md
+/Tools/vibration/*.md
