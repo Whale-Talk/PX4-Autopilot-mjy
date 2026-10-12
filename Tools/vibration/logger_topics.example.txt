@@ -1,0 +1,49 @@
+# Example: /fs/microsd/etc/logging/logger_topics.txt
+#
+# This file is OPTIONAL. The recommended way to capture raw FIFO vibration data is
+# the two instance masks introduced for this feature:
+#
+#     param set SDLOG_PROFILE 256      # bit 8: raw IMU gyro FIFO (add 1 or 512 as needed)
+#     param set SDLOG_GYR_MASK 1       # bit n selects sensor_gyro_fifo instance n
+#     param set SDLOG_ACC_MASK 1       # bit n selects sensor_accel_fifo instance n
+#
+# Read the notes below before using this file instead.
+#
+# ---------------------------------------------------------------------------
+# Semantics of this file (PX4 v1.16.1, src/modules/logger/logged_topics.cpp)
+# ---------------------------------------------------------------------------
+# 1. The file REPLACES the whole SDLOG_PROFILE topic list as soon as at least one
+#    line parses ("ntopics > 0"). You then own the complete flight topic list.
+# 2. A parsed line counts even when the topic name does not exist. A file with only
+#    unknown names therefore has no effect other than disabling the profile list.
+#    (The example from the parameter documentation: logger_topics.txt replaces all
+#    default topics.)
+# 3. Because the profile list is replaced, SDLOG_ACC_MASK / SDLOG_GYR_MASK are
+#    ignored while this file is in use, and the logger_status health subscriptions
+#    are not added automatically. Add them here if you need them.
+# 4. Format: <topic_name> [<interval_ms>] [<instance>]
+#      * interval omitted or 0  -> log every published sample (needed for FIFO data)
+#      * instance omitted       -> all instances of the topic are logged
+# 5. Only one config may own a topic: do not list the same topic twice expecting
+#    both entries; a repeated topic/instance pair only updates the interval.
+#
+# ---------------------------------------------------------------------------
+# Example: high-rate FIFO capture of a single gyro instance plus a few health topics
+# ---------------------------------------------------------------------------
+# Replace the whole list: the lines below are the complete logging configuration.
+sensor_gyro_fifo 0 0          # raw gyro FIFO, instance 0, full rate (do not set an interval)
+sensor_accel_fifo 0 0         # raw accel FIFO, instance 0, full rate
+logger_status 1000 0          # full log health (message type 0)
+logger_status 1000 1          # mission log health (message type 1)
+sensor_combined 0             # normal flight data the analysis tools also understand
+vehicle_attitude 20
+vehicle_angular_velocity 20
+actuator_motors 100
+vehicle_status 1000
+vehicle_gps_position 1000
+cpuload 1000
+#
+# Verify the resulting configuration before flying:
+#     Tools/vibration/px4_vibration_config_check.py --params params.txt --topics-file logger_topics.txt
+# and check the recorded file afterwards:
+#     Tools/vibration/px4_ulog_vibration_check.py log.ulg --expect-gyr-mask 1 --expect-acc-mask 1

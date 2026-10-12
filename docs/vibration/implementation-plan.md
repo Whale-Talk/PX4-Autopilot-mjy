@@ -50,7 +50,7 @@ ULog 工具复用既有 pyulog/numpy。按真实驱动语义展开 `samples` 个
 
 普通启动保留 `LOGGER_BUF=8 KiB` 默认；手动 CLI 默认 12 KiB 不能代替启动配置事实。实验通过 `/fs/microsd/etc/config.txt` 显式设置经验证的缓冲值，安装前保存并合并原文件，不覆盖其它用户配置，不自动安装到实机。
 
-按实际总流量、最长已测写卡停顿及余量选择缓冲，核验连续堆空间、任务栈和分配结果。以 `logger_status.buffer_size_bytes` 确认实际大小，不能只看配置值。800 包/s 的一对 FIFO 约 0.362 MB/s，8 KiB 只覆盖约 23 ms 这部分积压；这是流量预算示例，不是实板能力保证。测量 `logger_sd_write`、`logger_sd_fsync` 长尾及多轮 `sd_bench`，不以卡的标称速度替代。
+按实际总流量、最长已测写卡停顿及余量选择缓冲，核验连续堆空间、任务栈和分配结果。以 `logger_status.buffer_size_bytes` 确认实际大小，不能只看配置值。一条原生 FIFO ULog 数据记录约 226 B；若加速度与陀螺各发布 800 包/s（合计 1600 包/s），这对 FIFO 约 0.362 MB/s，8 KiB 只覆盖约 23 ms 这部分积压。若两者合计 800 包/s，则约 0.181 MB/s。这是流量预算示例，不是实板能力保证，发布频率需实测。测量 `logger_sd_write`、`logger_sd_fsync` 长尾及多轮 `sd_bench`，不以卡的标称速度替代。
 
 保存基线固件、参数/profile/mask、config.txt 和设备映射。持续地面采集至少覆盖预计飞行日志时长，检查 FIFO 溢出/复位、日志 dropout/message gap、有效通道连续性和资源余量。
 

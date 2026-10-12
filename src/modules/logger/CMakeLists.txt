@@ -56,3 +56,8 @@ px4_add_functional_gtest(
 	SRC LoggedTopicsTest.cpp
 	LINKLIBS modules__logger
 )
+
+px4_add_functional_gtest(
+	SRC LoggerFifoIntegrationTest.cpp
+	LINKLIBS modules__logger
+)
