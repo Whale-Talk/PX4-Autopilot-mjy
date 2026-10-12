@@ -338,14 +338,56 @@ void LoggedTopics::add_vision_and_avoidance_topics()
 	add_topic("vehicle_visual_odometry", 30);
 }
 
-void LoggedTopics::add_raw_imu_gyro_fifo()
+namespace
 {
-	add_topic("sensor_gyro_fifo");
+constexpr int32_t kInstanceMaskMax = 1023; /**< documented @max of SDLOG_ACC_MASK / SDLOG_GYR_MASK */
+
+/**
+ * Turn a SDLOG_*_MASK parameter value into the bitmask of instances to log.
+ *
+ * Negative or out-of-range values fall back to instance 0 (once per call, the
+ * stored parameter is left untouched). Bits above the build limit
+ * (ORB_MULTI_MAX_INSTANCES) are dropped; if nothing remains, no instance of
+ * that type is selected. This never expands to "all instances".
+ */
+uint16_t normalize_instance_mask(int32_t mask, const char *param_name)
+{
+	if (mask < 0 || mask > kInstanceMaskMax) {
+		PX4_WARN("%s invalid (%" PRId32 "), using 1", param_name, mask);
+		return 1u;
+	}
+
+	uint16_t instances = static_cast<uint16_t>(mask);
+	constexpr uint16_t kSupportedInstances = (1u << ORB_MULTI_MAX_INSTANCES) - 1u;
+
+	if (instances & ~kSupportedInstances) {
+		PX4_WARN("%s: ignoring unsupported instances (0x%03x -> 0x%03x, limit %u)", param_name,
+			 (unsigned)instances, (unsigned)(instances & kSupportedInstances), (unsigned)ORB_MULTI_MAX_INSTANCES);
+		instances &= kSupportedInstances;
+	}
+
+	return instances;
+}
+} // namespace
+
+void LoggedTopics::add_raw_imu_gyro_fifo(uint16_t instance_mask)
+{
+	for (uint8_t instance = 0; instance < ORB_MULTI_MAX_INSTANCES; instance++) {
+		if (instance_mask & (1u << instance)) {
+			// interval 0: log every published sample
+			add_topic("sensor_gyro_fifo", 0, instance);
+		}
+	}
 }
 
-void LoggedTopics::add_raw_imu_accel_fifo()
+void LoggedTopics::add_raw_imu_accel_fifo(uint16_t instance_mask)
 {
-	add_topic("sensor_accel_fifo");
+	for (uint8_t instance = 0; instance < ORB_MULTI_MAX_INSTANCES; instance++) {
+		if (instance_mask & (1u << instance)) {
+			// interval 0: log every published sample
+			add_topic("sensor_accel_fifo", 0, instance);
+		}
+	}
 }
 
 void LoggedTopics::add_system_identification_topics()
@@ -512,22 +554,34 @@ bool LoggedTopics::add_topic_multi(const char *name, uint16_t interval_ms, uint8
 	return true;
 }
 
-bool LoggedTopics::initialize_logged_topics(SDLogProfileMask profile)
+bool LoggedTopics::initialize_logged_topics(SDLogProfileMask profile, int32_t acc_mask, int32_t gyr_mask)
 {
 	int ntopics = add_topics_from_file(PX4_STORAGEDIR "/etc/logging/logger_topics.txt");
 
 	if (ntopics > 0) {
 		PX4_INFO("logging %d topics from logger_topics.txt", ntopics);
 
+		// An external topic list replaces the profile topics, so the instance masks are not
+		// applied to it. Point out a non-default selection once at startup instead of silently
+		// ignoring it.
+		if ((profile & SDLogProfileMask::RAW_IMU_GYRO_FIFO) || (profile & SDLogProfileMask::RAW_IMU_ACCEL_FIFO)) {
+			if (acc_mask != 1 || gyr_mask != 1) {
+				PX4_WARN("logger_topics.txt replaces the topic profile: SDLOG_ACC_MASK/SDLOG_GYR_MASK are ignored");
+			}
+		}
+
 	} else {
-		initialize_configured_topics(profile);
+		initialize_configured_topics(profile, acc_mask, gyr_mask);
 	}
 
 	return _subscriptions.count > 0;
 }
 
-void LoggedTopics::initialize_configured_topics(SDLogProfileMask profile)
+void LoggedTopics::initialize_configured_topics(SDLogProfileMask profile, int32_t acc_mask, int32_t gyr_mask)
 {
+	const bool raw_imu_gyro_fifo = profile & SDLogProfileMask::RAW_IMU_GYRO_FIFO;
+	const bool raw_imu_accel_fifo = profile & SDLogProfileMask::RAW_IMU_ACCEL_FIFO;
+
 	// load appropriate topics for profile
 	// the order matters: if several profiles add the same topic, the logging rate of the last one will be used
 	if (profile & SDLogProfileMask::DEFAULT) {
@@ -562,15 +616,25 @@ void LoggedTopics::initialize_configured_topics(SDLogProfileMask profile)
 		add_vision_and_avoidance_topics();
 	}
 
-	if (profile & SDLogProfileMask::RAW_IMU_GYRO_FIFO) {
-		add_raw_imu_gyro_fifo();
+	if (raw_imu_gyro_fifo) {
+		add_raw_imu_gyro_fifo(normalize_instance_mask(gyr_mask, "SDLOG_GYR_MASK"));
 	}
 
-	if (profile & SDLogProfileMask::RAW_IMU_ACCEL_FIFO) {
-		add_raw_imu_accel_fifo();
+	if (raw_imu_accel_fifo) {
+		add_raw_imu_accel_fifo(normalize_instance_mask(acc_mask, "SDLOG_ACC_MASK"));
 	}
 
 	if (profile & SDLogProfileMask::MAVLINK_TUNNEL) {
 		add_mavlink_tunnel();
+	}
+
+	// Health topic for the raw FIFO captures: logger_status is not part of the default profile.
+	// Subscribe both instances as regular subscriptions so that the first publication, which
+	// happens after the logger has started, is still recorded. Consumers distinguish the full and
+	// mission log by the message type field, not by the instance number alone. Nothing is added
+	// when no raw FIFO capture is enabled.
+	if (raw_imu_gyro_fifo || raw_imu_accel_fifo) {
+		add_topic("logger_status", 1000, 0);
+		add_topic("logger_status", 1000, 1);
 	}
 }

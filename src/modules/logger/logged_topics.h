@@ -101,7 +101,15 @@ public:
 	 */
 	void initialize_mission_topics(MissionLogType mission_log_type);
 
-	bool initialize_logged_topics(SDLogProfileMask profile);
+	/**
+	 * Initialize the subscription list.
+	 *
+	 * @param profile SDLOG_PROFILE bitmask
+	 * @param acc_mask SDLOG_ACC_MASK raw accelerometer instance bitmask
+	 * @param gyr_mask SDLOG_GYR_MASK raw gyroscope instance bitmask
+	 * @return true if at least one subscription was added
+	 */
+	bool initialize_logged_topics(SDLogProfileMask profile, int32_t acc_mask, int32_t gyr_mask);
 
 	const RequestedSubscriptionArray &subscriptions() const { return _subscriptions; }
 	int numMissionSubscriptions() const { return _num_mission_subs; }
@@ -161,8 +169,12 @@ private:
 
 	/**
 	 * Add topic subscriptions based on the profile configuration
+	 *
+	 * @param profile SDLOG_PROFILE bitmask
+	 * @param acc_mask SDLOG_ACC_MASK raw accelerometer instance bitmask
+	 * @param gyr_mask SDLOG_GYR_MASK raw gyroscope instance bitmask
 	 */
-	void initialize_configured_topics(SDLogProfileMask profile);
+	void initialize_configured_topics(SDLogProfileMask profile, int32_t acc_mask, int32_t gyr_mask);
 
 	void add_default_topics();
 	void add_estimator_replay_topics();
@@ -172,8 +184,19 @@ private:
 	void add_debug_topics();
 	void add_sensor_comparison_topics();
 	void add_vision_and_avoidance_topics();
-	void add_raw_imu_gyro_fifo();
-	void add_raw_imu_accel_fifo();
+
+	/**
+	 * Add the selected instances of the raw gyroscope FIFO topic at the full publication rate.
+	 * @param instance_mask bit n selects uORB instance n
+	 */
+	void add_raw_imu_gyro_fifo(uint16_t instance_mask);
+
+	/**
+	 * Add the selected instances of the raw accelerometer FIFO topic at the full publication rate.
+	 * @param instance_mask bit n selects uORB instance n
+	 */
+	void add_raw_imu_accel_fifo(uint16_t instance_mask);
+
 	void add_mavlink_tunnel();
 
 	/**

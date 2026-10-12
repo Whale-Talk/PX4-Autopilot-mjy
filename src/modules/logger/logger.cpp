@@ -526,7 +526,8 @@ bool Logger::initialize_topics()
 		}
 	}
 
-	if (!logged_topics.initialize_logged_topics(sdlog_profile)) {
+	if (!logged_topics.initialize_logged_topics(sdlog_profile, _param_sdlog_acc_mask.get(),
+			_param_sdlog_gyr_mask.get())) {
 		return false;
 	}
 

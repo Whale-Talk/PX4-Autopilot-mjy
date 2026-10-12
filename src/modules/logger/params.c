@@ -147,6 +147,58 @@ PARAM_DEFINE_INT32(SDLOG_MISSION, 0);
 PARAM_DEFINE_INT32(SDLOG_PROFILE, 1);
 
 /**
+ * Raw IMU accelerometer instances to log (bitmask)
+ *
+ * Bit n selects uORB instance n of the raw accelerometer FIFO topic
+ * (sensor_accel_fifo). The mask is only applied when SDLOG_PROFILE enables
+ * "Raw FIFO high-rate IMU (Accel)" (bit 9); otherwise it has no effect.
+ * Bits above the build limit (ORB_MULTI_MAX_INSTANCES) are ignored.
+ * 0 selects no instance of this type.
+ *
+ * @min 0
+ * @max 1023
+ * @bit 0 Instance 0
+ * @bit 1 Instance 1
+ * @bit 2 Instance 2
+ * @bit 3 Instance 3
+ * @bit 4 Instance 4
+ * @bit 5 Instance 5
+ * @bit 6 Instance 6
+ * @bit 7 Instance 7
+ * @bit 8 Instance 8
+ * @bit 9 Instance 9
+ * @reboot_required true
+ * @group SD Logging
+ */
+PARAM_DEFINE_INT32(SDLOG_ACC_MASK, 1);
+
+/**
+ * Raw IMU gyroscope instances to log (bitmask)
+ *
+ * Bit n selects uORB instance n of the raw gyroscope FIFO topic
+ * (sensor_gyro_fifo). The mask is only applied when SDLOG_PROFILE enables
+ * "Raw FIFO high-rate IMU (Gyro)" (bit 8); otherwise it has no effect.
+ * Bits above the build limit (ORB_MULTI_MAX_INSTANCES) are ignored.
+ * 0 selects no instance of this type.
+ *
+ * @min 0
+ * @max 1023
+ * @bit 0 Instance 0
+ * @bit 1 Instance 1
+ * @bit 2 Instance 2
+ * @bit 3 Instance 3
+ * @bit 4 Instance 4
+ * @bit 5 Instance 5
+ * @bit 6 Instance 6
+ * @bit 7 Instance 7
+ * @bit 8 Instance 8
+ * @bit 9 Instance 9
+ * @reboot_required true
+ * @group SD Logging
+ */
+PARAM_DEFINE_INT32(SDLOG_GYR_MASK, 1);
+
+/**
  * Maximum number of log directories to keep
  *
  * If there are more log directories than this value,
