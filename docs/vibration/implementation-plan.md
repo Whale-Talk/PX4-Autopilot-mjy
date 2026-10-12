@@ -7,7 +7,7 @@
 - 官方稳定版 `v1.16.1`，源码提交 `94cb2012792b2ae89f0b147cfee53ee31ae550be`。依据：[官方发布记录](https://github.com/PX4/PX4-Autopilot/releases/tag/v1.16.1)。
 - 功能分支 `feature/cuav-x7-vibration-logging`。从官方标签建立，不以 H1 适配分支 `seeex25d_H1@f298aad` 为父提交。
 - 工作区 `E:/07-Workspace_codex/px4-cuav-x7-vibration` 是原 `PX4-H1` 仓库的独立 worktree，共享提交和分支历史，原 H1 工作区的六个 Rockchip 暂存文件留在原索引。
-- 组织仓库 `NexusAir-Technologies/PX4-H1`；个人仓库 `Whale-Talk/PX4-H1`。仅推送本次功能分支，不强推、合并或修改原分支。
+- 组织仓库 `NexusAir-Technologies/PX4-H1`；个人仓库 `Whale-Talk/PX4-Autopilot-mjy`（经账号仓库列表和用户重新确认）。仅推送本次功能分支，不强推、合并或修改原分支。
 - 初始化父仓库记录的固定子模块提交，禁止 `submodule update --remote`。初始化本身不更改 gitlink；依赖、环境和验证记录作为阶段提交内容。
 - 每次只提交明确拥有的文件，不使用 `git add -A` 或 DSH 自动全量提交，不混入原六个文件。沿用现有提交身份。
 - 远程凭据不进入日志、文档或 DSH 指令；使用正常 Git 连接和凭据管理。
