@@ -61,6 +61,10 @@ int  writer_submit(writer_t *w, const vib_block_header_t *bh, const void *payloa
 /* 停止线程、写结束块（block_type=0xFFFF）、fsync、关闭。 */
 void writer_finish(writer_t *w, uint32_t final_lost_total);
 
+/* 中止：停止线程，**不写结束块**（文件在头部之后被截断）。解析器据此判定
+ * 非正常结束（缺结束块），配合 0 记录时判为空/中止采集，绝不当作健康。 */
+void writer_abort(writer_t *w);
+
 const char *writer_path(const writer_t *w);
 int         writer_error(const writer_t *w);
 

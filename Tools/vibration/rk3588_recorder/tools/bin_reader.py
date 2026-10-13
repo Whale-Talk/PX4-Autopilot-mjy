@@ -152,6 +152,13 @@ class BinReader:
         self.crc_block_errors = 0
         self.tmst_hist = Counter()
         self.tmst_big = 0
+        self.tmst_dup = 0          # 重复时间戳次数（异常，不得静默吞掉）
+        self.tmst_breaks = 0       # 时间轴断裂次数（dup 或 big）
+        self.current_segment = 0
+        self.segments = []         # 连续段 [{segment_id, first_us, last_us, samples}]
+        self.seg_first_us = 0.0
+        self.seg_last_us = 0.0
+        self.seg_samples = 0
         self.tmst_out_of_window = 0
         self.tmst_min = None
         self.tmst_max = None
@@ -161,9 +168,24 @@ class BinReader:
         self.tmst_abs_us = 0.0         # 展开后的物理绝对时间轴（µs，浮点，供 CSV）
         self.ticks_to_us_num = TMST_SCALE_NUM
         self.ticks_to_us_den = TMST_SCALE_DEN
+        self.first_t_read_ns = None    # 首个数据块的 t_read（主机采集窗口起点）
+        self.last_t_read_ns = None     # 末个数据块的 t_read（主机采集窗口终点）
         self.end_block_seen = False
         self.axes = {a: RunningStat() for a in AXES}
         self.temp_c = RunningStat()
+
+    def _finalize_segment(self):
+        """关闭当前连续段，开始新段（时间轴在 dup/big 处断裂）。"""
+        if self.seg_samples > 0:
+            self.segments.append({
+                "segment_id": self.current_segment,
+                "first_us": round(self.seg_first_us, 3),
+                "last_us": round(self.seg_last_us, 3),
+                "samples": self.seg_samples,
+            })
+        self.current_segment += 1
+        self.seg_first_us = self.seg_last_us
+        self.seg_samples = 0
 
     # ------------------------------------------------------------------ 头部
     def _read_file_header(self, f) -> None:
@@ -201,6 +223,21 @@ class BinReader:
                 "时间戳换算 scale 缺失/为 0：按 raw=µs 处理。这对应 legacy v2 的旧假设，"
                 "物理时间轴不可信（Rev 1.6 §12.7 要求 µs = raw*32/30）")
 
+        # ---- 不支持的时钟源/分辨率/元数据：明确拒绝，不当可信物理时间 ----
+        if ver >= 3:
+            if tmst_source != 0:
+                self.errors.append(
+                    "文件头 tmst_source=%d 不受支持（本实现仅支持内部时钟 0；CLKIN=1 的时间"
+                    "解释不同，予以拒绝）" % tmst_source)
+            if tmst_res != 0:
+                self.errors.append(
+                    "文件头 tmst_res=%d 不受支持（本实现仅支持 RES=0 名义 1 µs；RES=1 的 "
+                    "16 µs 分辨率时间解释不同，予以拒绝）" % tmst_res)
+            if count_unit not in (0, 1, 16):
+                self.errors.append("文件头 count_unit=%d 非法（应为 0/1/16）" % count_unit)
+            if count_endian not in (0, 1):
+                self.errors.append("文件头 count_endian=%d 非法（应为 0/1）" % count_endian)
+
         self.fh = {
             "magic": magic.decode("ascii", "replace"),
             "format_version": ver,
@@ -236,7 +273,7 @@ class BinReader:
         csv_f = None
         if self.csv_path:
             csv_f = open(self.csv_path, "w", encoding="utf-8", newline="")
-            csv_f.write("index,t_us," + ",".join(AXES) + ",temp_c,rec_flags\n")
+            csv_f.write("index,segment,t_us," + ",".join(AXES) + ",temp_c,rec_flags\n")
 
         truncated = False
         with open(self.path, "rb") as f:
@@ -296,6 +333,12 @@ class BinReader:
                 if bflags & BLOCK_FLAG_SPI_ERR:
                     self.spi_err_blocks += 1
 
+                # 主机采集窗口：用数据块的 t_read（批量读完成时刻，非采样时刻）
+                if btype == BLOCK_TYPE_DATA:
+                    if self.first_t_read_ns is None:
+                        self.first_t_read_ns = t_read
+                    self.last_t_read_ns = t_read
+
                 if btype == BLOCK_TYPE_END:
                     self.end_block_seen = True
                     break
@@ -330,11 +373,15 @@ class BinReader:
                         d = tmst - self.prev_tmst
                         if d < 0:
                             d += TMST_WRAP
-                        if d <= 0:
-                            self.prev_tmst = tmst
-                            continue
-                        if d >= 4096:
+                        if d == 0:
+                            # 重复时间戳：异常，时间轴断裂，显式标记（不得静默吞掉）
+                            self.tmst_dup += 1
+                            self.tmst_breaks += 1
+                            self._finalize_segment()
+                        elif d >= 4096:
                             self.tmst_big += 1
+                            self.tmst_breaks += 1
+                            self._finalize_segment()
                         else:
                             self.tmst_raw_total += d
                             self.tmst_n_deltas += 1
@@ -346,7 +393,9 @@ class BinReader:
                             if self.tmst_max is None or d > self.tmst_max:
                                 self.tmst_max = d
                             self.tmst_abs_us += d * self.ticks_to_us_num / self.ticks_to_us_den
+                            self.seg_last_us = self.tmst_abs_us
                     self.prev_tmst = tmst
+                    self.seg_samples += 1
 
                     # 物理量
                     self.axes["ax"].push(ax / LSB_PER_G)
@@ -358,8 +407,8 @@ class BinReader:
                     self.temp_c.push(temp_raw / 2.07 + 25.0)
 
                     if csv_f:
-                        csv_f.write("%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.3f,%d\n" % (
-                            idx, self.tmst_abs_us,
+                        csv_f.write("%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.3f,%d\n" % (
+                            idx, self.current_segment, self.tmst_abs_us,
                             ax / LSB_PER_G, ay / LSB_PER_G, az / LSB_PER_G,
                             gx / LSB_PER_DPS, gy / LSB_PER_DPS, gz / LSB_PER_DPS,
                             temp_raw / 2.07 + 25.0, rflags))
@@ -401,8 +450,21 @@ class BinReader:
             self.anomalies.append(f"block_index 有 {self.block_index_gaps} 处跳变，"
                                   f"共缺 {self.missing_blocks} 个块（主机侧丢块）")
         if self.tmst_big:
-            self.anomalies.append(f"{self.tmst_big} 处 Δtmst ≥ 4096 µs"
+            self.anomalies.append(f"{self.tmst_big} 处 Δtmst ≥ 4096 raw ticks"
                                   "（记录时间戳字节序或 ODR 配置可疑）")
+        if self.tmst_dup:
+            self.anomalies.append(f"{self.tmst_dup} 处重复时间戳（Δtmst==0）——"
+                                  "时间轴断裂，不可信")
+        if self.tmst_breaks:
+            self.anomalies.append(f"{self.tmst_breaks} 处时间轴断裂（重复或大间隔），"
+                                  "跨段物理时间不可比")
+
+        # 关闭最后一个连续段
+        self._finalize_segment()
+
+        # 空采集：绝不能报告为健康（对应启动 flush/baseline 失败后 writer_abort 的截断文件）
+        if self.records == 0:
+            self.errors.append("空采集：文件无任何数据记录（0 条）——中止/失败采集，不是健康采集")
 
         self._finalize(device_lost, clip_ratio)
         return self.stats
@@ -423,6 +485,16 @@ class BinReader:
         total_us = self.tmst_raw_total * self.ticks_to_us_num / self.ticks_to_us_den
         measured_odr = (n_delta * 1e6 / total_us) if total_us > 0 and n_delta else None
         duration_s = total_us / 1e6 if total_us else 0.0
+
+        # 独立主机采样率：按数据块 t_read（读时刻，非采样时刻）定义的采集窗口，
+        # 不含 writer 关闭耗时；边界不确定度 = FIFO 满窗 16 ms。
+        host_window_s = None
+        host_rate_hz = None
+        if (self.first_t_read_ns is not None and self.last_t_read_ns is not None
+                and self.last_t_read_ns > self.first_t_read_ns):
+            host_window_s = (self.last_t_read_ns - self.first_t_read_ns) / 1e9
+            if host_window_s > 0:
+                host_rate_hz = self.records / host_window_s
 
         self.stats = {
             "file": self.path,
@@ -464,6 +536,15 @@ class BinReader:
                 "tmst_out_of_window_ratio": (
                     round(self.tmst_out_of_window / n_delta, 8) if n_delta else 0.0),
                 "tmst_big_delta": self.tmst_big,
+                "tmst_dup": self.tmst_dup,
+                "tmst_breaks": self.tmst_breaks,
+                "host_rate_hz": round(host_rate_hz, 3) if host_rate_hz else None,
+                "host_window_s": round(host_window_s, 6) if host_window_s else None,
+                "host_rate_boundary_uncertainty_us": 16000,
+            },
+            "timeline": {
+                "segments": self.segments,
+                "tmst_breaks": self.tmst_breaks,
             },
             "physical": {a: self.axes[a].as_dict() for a in AXES},
             "temp": self.temp_c.as_dict(),

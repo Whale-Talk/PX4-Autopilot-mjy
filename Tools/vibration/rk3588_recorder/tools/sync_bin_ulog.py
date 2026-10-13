@@ -1,57 +1,93 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sync_bin_ulog.py — 外置 .bin（RK3588 直接采集）与 X7 native FIFO ULog 的时间映射
+sync_bin_ulog.py — 外置 .bin（RK3588 直接采集）与 X7 native FIFO ULog 的软件时间映射
 
-目的：把外置原始记录（raw ticks → 物理 µs）的样本时间轴，映射到 X7 原生
-sensor_accel_fifo / sensor_gyro_fifo 的样本时间轴，输出 offset + drift(ppm) 与
-校正残差。**绝对 offset 可以很大**——外置时间轴从 0 起，X7 时间轴是绝对 µs，
-两者相差整个采集起点，验收只看校正后残差，不看 offset<10ms，也不看谱峰一致。
+目的：把外置原始记录（raw ticks → 物理 µs）的逐样本时间轴，与 X7 原生
+sensor_accel_fifo / sensor_gyro_fifo 的逐样本时间轴（timestamp_sample 最后样本
+锚点 + dt 还原），通过一组**匹配事件**拟合 offset + drift(ppm)，并给出校正后
+残差与可用性判据。**无物理 GPIO/FSYNC，无硬件同步完成宣称**——绝对 offset 大小
+不是判据，验收只看校正后残差是否与事件的明确不确定度一致。
 
-关键口径（与振动工程读取契约一致，见 Tools/vibration/vibration_analysis.py）：
-  * X7 原生 FIFO 的 ``timestamp_sample`` 是**本包最后一条样本**的锚点，``dt`` 单位
-    是 µs（不硬编码 125），还原 t_i = T - (N-1-i)*dt。
-  * X7 的 timestamp 已经是 µs，**不要再乘 32/30**（那是外置 ICM raw ticks 的换算）。
-  * device_id / 实例 / 缺包变化分段；每包按 ``samples`` 有效前缀，每包独立 ``scale``。
-  * 外置 raw ticks → µs = raw * 32/30（Rev 1.6 §12.7），由 bin 文件头元数据给出。
+导出（可检验、可流式，恒定内存）：
+  --csv-ext PATH  外置逐样本时间轴：index,segment,t_us(相对首样本=0),ax[g],...,temp_c
+  --csv-x7  PATH  X7 选定 device 段逐样本：packet,index_in_packet,t_us(绝对µs),
+                  device_id,x_<unit>,y_<unit>,z_<unit>（值 = raw*scale，per-packet scale）
 
-边界与不宣称：
-  * 无物理 GPIO/FSYNC，无硬件同步完成宣称。本工具只做软件层面的时间轴对齐。
-  * 互相关仅作粗估（且含机械滤波群延迟），本工具不把互相关当同步判据。
-  * 旧 200 Hz 日志不冒充高率：只接受 native FIFO 主题。
+事件输入（--events events.json，唯一真源）：
+  {"events": [{"external_us": 123.4, "x7_us": 987654.3, "label": "tap1",
+               "provenance": "manual-tap", "uncertainty_us": 500.0}, ...]}
+  external_us = 以外置 .bin 首样本为 0 的相对物理 µs；x7_us = X7 绝对 µs；
+  uncertainty_us 必须为正有限；label / provenance 必须非空（provenance 缺失即拒绝）。
 
-匹配事件输入（--events events.json）是同步的**唯一真源**，格式：
-  {"events": [{"external_us": 123.4, "x7_us": 987654.3,
-               "label": "tap1", "uncertainty_us": 500.0}, ...]}
-  external_us 以外置 .bin 首样本为 0 的相对物理 µs；x7_us 为 X7 绝对 µs。
+口径（与 Tools/vibration/vibration_analysis.py 读取契约一致）：
+  * X7 timestamp_sample 是**本包最后样本**锚点；dt 单位 µs（不硬编码 125）；
+    t_i = T - (N-1-i)*dt。X7 timestamp 已是 µs，**不再乘 32/30**。
+  * 每包按 samples 有效前缀（padding 忽略），每包独立 scale。
+  * device_id=0 拒绝；device_id / 实例 / 缺包 / 回退 / 重复真正分段。
+  * 外置 raw ticks → µs = raw * 32/30（由 .bin 文件头元数据给出）。
+
+判据（明示，见 fit_events）：
+  至少 3 个独立事件；事件都落在对应连续段内；抗离群（Theil-Sen）稳健拟合后对
+  内点重拟合；斜率受合理时钟比约束（|drift_ppm| ≤ --max-drift-ppm）；按
+  「|残差| ≤ 3×uncertainty」判定可用。高不确定度时即使零残差也不宣称可用于
+  500 Hz（usable_for_500hz 需残差与不确定度都 ≤ 200 µs）。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# 外置工具目录（rk3588_recorder/tools）与父振动工具目录（Tools/vibration）
 sys.path.insert(0, HERE)
-_VIBDIR = os.path.dirname(HERE)          # rk3588_recorder
-_PARENT = os.path.dirname(_VIBDIR)       # Tools/vibration
+_PARENT = os.path.dirname(os.path.dirname(HERE))   # Tools/vibration
 if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
 
-import bin_reader as br          # noqa: E402  (本目录)
-import ulog_reader               # noqa: E402  (父目录)
-import vibration_analysis as va  # noqa: E402  (父目录)
+import bin_reader as br          # noqa: E402
+import ulog_reader               # noqa: E402
+import vibration_analysis as va  # noqa: E402
+
+MIN_EVENTS = 3
+DEFAULT_MAX_DRIFT_PPM = 10000.0       # 1%：更松会允许明显错配
+ALIGN_500HZ_US = 200.0                # 500 Hz 采样周期 2000 µs 的 10%，保守对齐上限
+GAP_TOLERANCE_US = 2000.0             # X7 相邻锚点跳变容忍（与振动分析一致）
+
+UNIT_BY_AXIS = {"accel": ("m/s^2", "x_m_s2", "y_m_s2", "z_m_s2"),
+                "gyro": ("rad/s", "x_rad_s", "y_rad_s", "z_rad_s")}
 
 
-def read_external_axis(binpath):
-    """读取外置 .bin 的物理时间轴来源/跨度（首样本为 0 的相对 µs）。"""
+def _finite(v):
+    try:
+        return math.isfinite(float(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def _median(values):
+    s = sorted(values)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    if n % 2:
+        return float(s[n // 2])
+    return 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+# ---------------------------------------------------------------------------
+# 外置 .bin 时间轴
+# ---------------------------------------------------------------------------
+def read_external(binpath):
+    """读取外置 .bin 的时间轴来源/跨度/连续段（首样本为 0 的相对 µs）。"""
     reader = br.BinReader(binpath)
     stats = reader.run()
     timing = stats["timing"]
     header = stats["header"]
+    timeline = stats.get("timeline", {})
     return {
         "path": binpath,
         "records": stats["integrity"]["records"],
@@ -60,48 +96,111 @@ def read_external_axis(binpath):
         "ticks_to_us_num": header.get("tmst_scale_num"),
         "ticks_to_us_den": header.get("tmst_scale_den"),
         "tmst_source": header.get("tmst_source"),
+        "tmst_res": header.get("tmst_res"),
         "measured_odr_hz": timing["measured_odr_hz"],
+        "host_rate_hz": timing.get("host_rate_hz"),
+        "segments": timeline.get("segments", []),
+        "tmst_breaks": timeline.get("tmst_breaks", 0),
         "ok": stats["ok"],
+        "errors": stats["errors"],
+        "anomalies": stats["anomalies"],
     }
 
 
-def reconstruct_x7_segments(dataset):
-    """按读取契约还原 X7 native FIFO 每包首样本时间。
+# ---------------------------------------------------------------------------
+# X7 native FIFO 分段与逐样本
+# ---------------------------------------------------------------------------
+def _sample_value(axis_rows, k, i):
+    row = axis_rows[k]
+    if isinstance(row, (list, tuple)) and i < len(row):
+        return row[i]
+    return row
 
-    t_i = T - (N-1-i)*dt，T = timestamp_sample（µs，最后样本锚点）。
-    返回按 device_id 分段的列表，每段含每包 (anchor_us, n, dt_us, first_us, last_us)。
-    缺包（锚点跳变远大于 N*dt）在段内被标记为 gap。
+
+def reconstruct_x7_segments(dataset, gap_tolerance_us=GAP_TOLERANCE_US):
+    """按读取契约还原 X7 native FIFO 每包样本时间，并按连续段切分。
+
+    返回 dict:
+      segments: list[{device_id, packets:[{packet_index, anchor_us, n, dt_us,
+                  first_us, last_us, scale}]}]
+      device0_packets / invalid_dt / invalid_scale / invalid_samples / breaks
+    断段条件（真正断段，不是计数）：device_id 变化、锚点回退、重复包、缺包
+    （相邻锚点跳变 > 上包覆盖时长 + 容忍）。device_id=0 拒绝。padding 忽略。
     """
     segments = []
-    prev_device = None
+    stats = {"device0_packets": 0, "invalid_dt": 0, "invalid_scale": 0,
+             "invalid_samples": 0, "breaks": 0}
+
+    anchors = dataset.get("timestamp_sample")
+    ts_rows = dataset.get("timestamp")
+    devices = dataset.get("device_id")
+    dts = dataset.get("dt")
+    scales = dataset.get("scale")
+    samples = dataset.get("samples")
+
+    cur = None
+    prev = None          # last valid packet dict
     for k in range(dataset.count):
-        anchor = int(dataset.get("timestamp_sample")[k])
-        dt = float(dataset.get("dt")[k])
-        n = int(dataset.get("samples")[k])
-        device = int(dataset.get("device_id")[k])
-        valid = n if 1 <= n <= va.FIFO_SAMPLES_MAX else 0
-        first = anchor - (valid - 1) * dt if valid else anchor
+        device_id = int(devices[k])
+        if device_id == 0:
+            stats["device0_packets"] += 1
+            cur = None
+            prev = None
+            continue
+        dt = float(dts[k])
+        scale = float(scales[k])
+        count = int(samples[k])
+        if not _finite(dt) or dt <= 0.0:
+            stats["invalid_dt"] += 1
+            cur = None
+            prev = None
+            continue
+        if not _finite(scale) or scale == 0.0:
+            stats["invalid_scale"] += 1
+            cur = None
+            prev = None
+            continue
+        if count < 1 or count > va.FIFO_SAMPLES_MAX:
+            stats["invalid_samples"] += 1
+            cur = None
+            prev = None
+            continue
 
-        if device != prev_device:
-            segments.append({"device_id": device, "packets": [], "gap_count": 0})
-            prev_device = device
-        seg = segments[-1]
-        seg["packets"].append({
-            "anchor_us": anchor, "n": valid, "dt_us": dt,
-            "first_us": first, "last_us": anchor,
-        })
-        # 缺包：相邻锚点跳变远大于本包样本覆盖的时长（保守阈值 2×）
-        if len(seg["packets"]) >= 2 and dt > 0 and valid:
-            prev = seg["packets"][-2]
-            expected_span = valid * dt
-            jump = anchor - prev["anchor_us"]
-            if jump > 2 * expected_span:
-                seg["gap_count"] += 1
-    return segments
+        anchor = int(anchors[k])
+        ts = int(ts_rows[k])
+        valid = count
+        first = anchor - (valid - 1) * dt
+        pkt = {"packet_index": k, "anchor_us": anchor, "n": valid, "dt_us": dt,
+               "first_us": first, "last_us": anchor, "scale": scale}
+
+        # 断段判定
+        new_segment = False
+        if cur is None or device_id != cur["device_id"]:
+            new_segment = True
+        elif prev is not None:
+            if anchor < prev["anchor_us"]:
+                stats["breaks"] += 1
+                new_segment = True
+            elif anchor == prev["anchor_us"] and ts == int(ts_rows[prev["packet_index"]]):
+                stats["breaks"] += 1
+                new_segment = True
+            else:
+                expected = prev["n"] * prev["dt_us"]
+                if anchor - prev["anchor_us"] > expected + gap_tolerance_us:
+                    stats["breaks"] += 1
+                    new_segment = True
+
+        if new_segment:
+            cur = {"device_id": device_id, "packets": []}
+            segments.append(cur)
+        cur["packets"].append(pkt)
+        prev = pkt
+
+    return segments, stats
 
 
-def x7_timeline_span(segments):
-    """X7 时间轴覆盖范围（按 device_id 分段，避免跨器件假跨度）。"""
+def x7_spans(segments):
+    """按 device_id 汇总每段的连续时间跨度（跨器件不假合并）。"""
     spans = []
     for seg in segments:
         pk = seg["packets"]
@@ -112,107 +211,280 @@ def x7_timeline_span(segments):
             "first_us": min(p["first_us"] for p in pk),
             "last_us": max(p["last_us"] for p in pk),
             "packets": len(pk),
-            "gap_count": seg["gap_count"],
+            "samples": sum(p["n"] for p in pk),
         })
     return spans
 
 
-def fit_linear(ext_us, x7_us):
-    """最小二乘拟合 x7 = a*ext + b。返回 (a, b) 或 None（点不足/退化解）。"""
-    n = len(ext_us)
+def x7_sample_iter(dataset, segments, device_id, axis):
+    """流式产出选定 device 段的逐样本 (t_us, device_id, x, y, z)。
+
+    值 = raw * per-packet scale（accel m/s^2，gyro rad/s）；t_us = 绝对 µs。
+    """
+    xs = dataset.get("x")
+    ys = dataset.get("y")
+    zs = dataset.get("z")
+    for seg in segments:
+        if device_id is not None and seg["device_id"] != device_id:
+            continue
+        for pkt in seg["packets"]:
+            k = pkt["packet_index"]
+            n, dt, anchor, scale = pkt["n"], pkt["dt_us"], pkt["anchor_us"], pkt["scale"]
+            for i in range(n):
+                t_us = anchor - (n - 1 - i) * dt
+                x = _sample_value(xs, k, i) * scale
+                y = _sample_value(ys, k, i) * scale
+                z = _sample_value(zs, k, i) * scale
+                yield (t_us, seg["device_id"], x, y, z)
+
+
+# ---------------------------------------------------------------------------
+# 事件校验与稳健拟合
+# ---------------------------------------------------------------------------
+def validate_events(events):
+    """校验事件：正有限不确定度、非空 label/provenance、有限时间。返回 (cleaned, problems)。"""
+    cleaned, problems = [], []
+    for i, e in enumerate(events):
+        label = e.get("label")
+        provenance = e.get("provenance")
+        ext = e.get("external_us")
+        x7 = e.get("x7_us")
+        unc = e.get("uncertainty_us")
+        if not isinstance(label, str) or not label.strip():
+            problems.append("event %d missing/empty label" % i)
+            continue
+        if not isinstance(provenance, str) or not provenance.strip():
+            problems.append("event %r missing provenance" % label)
+            continue
+        if not _finite(ext) or not _finite(x7):
+            problems.append("event %r has non-finite external_us/x7_us" % label)
+            continue
+        if not _finite(unc) or float(unc) <= 0.0:
+            problems.append("event %r has non-positive/non-finite uncertainty_us" % label)
+            continue
+        cleaned.append({"label": label, "provenance": provenance,
+                        "external_us": float(ext), "x7_us": float(x7),
+                        "uncertainty_us": float(unc)})
+    return cleaned, problems
+
+
+def _ols(ext, x7):
+    n = len(ext)
     if n < 2:
         return None
-    mx = sum(ext_us) / n
-    my = sum(x7_us) / n
-    sxx = sum((x - mx) ** 2 for x in ext_us)
-    sxy = sum((x - mx) * (y - my) for x, y in zip(ext_us, x7_us))
+    mx = sum(ext) / n
+    my = sum(x7) / n
+    sxx = sum((x - mx) ** 2 for x in ext)
     if sxx <= 0:
         return None
+    sxy = sum((x - mx) * (y - my) for x, y in zip(ext, x7))
     a = sxy / sxx
     b = my - a * mx
     return a, b
 
 
-def fit_events(events):
-    """从匹配事件拟合 offset+drift，计算残差并识别离群。
+def _wls(ext, x7, w):
+    sw = sum(w)
+    if sw <= 0 or len(ext) < 2:
+        return None
+    mx = sum(wi * x for wi, x in zip(w, ext)) / sw
+    my = sum(wi * y for wi, y in zip(w, x7)) / sw
+    sxx = sum(wi * (x - mx) ** 2 for wi, x in zip(w, ext))
+    if sxx <= 0:
+        return None
+    sxy = sum(wi * (x - mx) * (y - my) for wi, x, y in zip(w, ext, x7))
+    a = sxy / sxx
+    b = my - a * mx
+    return a, b
 
-    events: list of dict(external_us, x7_us, label?, uncertainty_us?)
-    返回 dict: offset_us, drift_ppm, slope, intercept_us, residual_rms_us,
-    residual_us (per event), outlier_labels, notes, n_events。
+
+def _theil_sen(ext, x7):
+    """Theil-Sen 稳健斜率 + 中位截距。对抗单点杠杆/离群。"""
+    n = len(ext)
+    slopes = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            if ext[j] != ext[i]:
+                slopes.append((x7[j] - x7[i]) / (ext[j] - ext[i]))
+    if not slopes:
+        return None
+    slope = _median(slopes)
+    intercept = _median(y - slope * x for x, y in zip(ext, x7))
+    return slope, intercept
+
+
+def fit_events(events, ext_first, ext_last, x7_segments, device_id,
+               max_drift_ppm=DEFAULT_MAX_DRIFT_PPM):
+    """从匹配事件拟合 offset+drift，按明示判据给出结论。
+
+    返回 dict：status / slope / drift_ppm / intercept_us / offset_us /
+    residual_rms_us / residual_max_us / residual_us / residual_uncertainty_ratio /
+    inlier_labels / outlier_labels / n_events / n_inliers / median_uncertainty_us /
+    usable_for_500hz / notes。
+    status ∈ {ok, insufficient_events, invalid_events, out_of_range,
+              no_x7_segment, degenerate, unreasonable_clock_ratio,
+              residual_exceeds_uncertainty}
     """
-    ext = [float(e["external_us"]) for e in events]
-    x7 = [float(e["x7_us"]) for e in events]
-    labels = [e.get("label") or "#%d" % (i + 1) for i, e in enumerate(events)]
     out = {
-        "n_events": len(ext),
-        "offset_us": None, "drift_ppm": None, "slope": None,
-        "intercept_us": None, "residual_rms_us": None,
-        "residual_us": [], "outlier_labels": [], "notes": [],
+        "n_events": len(events), "n_inliers": 0,
+        "status": "invalid_events",
+        "slope": None, "drift_ppm": None, "intercept_us": None, "offset_us": None,
+        "residual_rms_us": None, "residual_max_us": None,
+        "residual_us": [], "residual_uncertainty_ratio": None,
+        "inlier_labels": [], "outlier_labels": [],
+        "median_uncertainty_us": None, "usable_for_500hz": False, "notes": [],
     }
 
-    if len(ext) < 1:
-        out["notes"].append("无匹配事件：无法拟合。")
+    if len(events) < MIN_EVENTS:
+        out["status"] = "insufficient_events"
+        out["notes"].append("事件数 %d < %d：不足以估计 offset+drift（缺证据）"
+                            % (len(events), MIN_EVENTS))
         return out
 
-    if len(ext) == 1:
-        # 只有 1 个事件：只能给 offset，不给 drift
-        out["offset_us"] = x7[0] - ext[0]
-        out["residual_us"] = [0.0]
-        out["notes"].append("仅 1 个匹配事件：只能给出 offset，无法估计 drift。")
+    ext_us = [e["external_us"] for e in events]
+    x7_us = [e["x7_us"] for e in events]
+    unc = [e["uncertainty_us"] for e in events]
+    labels = [e["label"] for e in events]
+
+    # X7 侧：选定 device 的连续段覆盖；无有效段 → 无法映射
+    if device_id is None:
+        sel_segs = x7_segments
+    else:
+        sel_segs = [s for s in x7_segments if s["device_id"] == device_id]
+    if not sel_segs or not any(s["packets"] for s in sel_segs):
+        out["status"] = "no_x7_segment"
+        out["notes"].append("选定的 X7 device 无有效连续段（或无 packets）")
+        return out
+    x7_first = min(min(p["first_us"] for p in s["packets"]) for s in sel_segs)
+    x7_last = max(max(p["last_us"] for p in s["packets"]) for s in sel_segs)
+
+    # 范围检查：事件必须落在对应连续段内（外置 [0,t_end]，X7 选定段）
+    for e in events:
+        if not (ext_first <= e["external_us"] <= ext_last):
+            out["status"] = "out_of_range"
+            out["notes"].append("事件 %r external_us=%g 在外置时间轴 [%g,%g] 之外"
+                                % (e["label"], e["external_us"], ext_first, ext_last))
+            return out
+        if not (x7_first <= e["x7_us"] <= x7_last):
+            out["status"] = "out_of_range"
+            out["notes"].append("事件 %r x7_us=%g 在选定 X7 段 [%g,%g] 之外"
+                                % (e["label"], e["x7_us"], x7_first, x7_last))
+            return out
+
+    # 稳健拟合（Theil-Sen）→ 内点 → 重拟合（不确定度加权）
+    robust = _theil_sen(ext_us, x7_us)
+    if robust is None:
+        out["status"] = "degenerate"
+        out["notes"].append("事件时间轴退化（external_us 全同或不足）")
+        return out
+    r_slope, r_intercept = robust
+
+    # 稳健残差 → MAD 内点
+    resid_robust = [y - (r_slope * x + r_intercept) for x, y in zip(ext_us, x7_us)]
+    med_resid = _median(resid_robust)
+    mad = _median([abs(r - med_resid) for r in resid_robust])
+    thresh = max(3.0 * 1.4826 * mad, 1.0)
+    inlier_idx = [i for i, r in enumerate(resid_robust) if abs(r - med_resid) <= thresh]
+
+    if len(inlier_idx) < MIN_EVENTS:
+        out["status"] = "residual_exceeds_uncertainty"
+        out["outlier_labels"] = labels
+        out["notes"].append("稳健拟合后内点仅 %d 个（< %d）：多数事件不一致，无法给出可信映射"
+                            % (len(inlier_idx), MIN_EVENTS))
         return out
 
-    fit = fit_linear(ext, x7)
-    if fit is None:
-        out["notes"].append("匹配事件时间轴退化解（external_us 全同）：无法拟合。")
+    w = [1.0 / (unc[i] ** 2) for i in inlier_idx]
+    refit = _wls([ext_us[i] for i in inlier_idx], [x7_us[i] for i in inlier_idx], w)
+    if refit is None:
+        out["status"] = "degenerate"
+        out["notes"].append("内点重拟合退化解")
+        return out
+    slope, intercept = refit
+
+    drift_ppm = (slope - 1.0) * 1e6
+    if abs(drift_ppm) > max_drift_ppm:
+        out["status"] = "unreasonable_clock_ratio"
+        out["slope"] = slope
+        out["drift_ppm"] = drift_ppm
+        out["notes"].append("时钟比不合理：drift=%.1f ppm 超出 ±%.1f ppm"
+                            % (drift_ppm, max_drift_ppm))
         return out
 
-    a, b = fit
-    resid = [y - (a * x + b) for x, y in zip(ext, x7)]
-    rms = (sum(r * r for r in resid) / len(resid)) ** 0.5
-    # 离群识别：把「最大残差」与「其余点的 RMS」比较，避免离群自身把 3×RMS 抬高。
-    # 小噪声（亚毫秒）不被误判；明显离群（几十 ms）被标记。
-    outliers = []
-    if len(resid) >= 3:
-        order = sorted(range(len(resid)), key=lambda i: abs(resid[i]), reverse=True)
-        worst_i = order[0]
-        others = [resid[i] for i in order[1:]]
-        rms_others = (sum(r * r for r in others) / len(others)) ** 0.5
-        threshold = max(3.0 * rms_others, 1000.0)
-        if abs(resid[worst_i]) > threshold:
-            outliers.append(labels[worst_i])
+    resid = [y - (slope * x + intercept) for x, y in zip(ext_us, x7_us)]
+    inlier_resid = [resid[i] for i in inlier_idx]
+    rms = math.sqrt(sum(r * r for r in inlier_resid) / len(inlier_resid))
+    max_resid = max(abs(r) for r in inlier_resid)
+    ratio = max(abs(resid[i]) / unc[i] for i in inlier_idx)
+    outlier_labels = [labels[i] for i in range(len(labels)) if i not in inlier_idx]
 
     out.update({
-        "slope": a,
-        "drift_ppm": (a - 1.0) * 1e6,
-        "intercept_us": b,
-        "offset_us": (sum(y - x for x, y in zip(ext, x7)) / len(ext)),
+        "n_inliers": len(inlier_idx),
+        "slope": slope,
+        "drift_ppm": drift_ppm,
+        "intercept_us": intercept,
+        "offset_us": sum(x7_us[i] - ext_us[i] for i in inlier_idx) / len(inlier_idx),
         "residual_rms_us": rms,
+        "residual_max_us": max_resid,
         "residual_us": [round(r, 3) for r in resid],
-        "outlier_labels": outliers,
+        "residual_uncertainty_ratio": ratio,
+        "inlier_labels": [labels[i] for i in inlier_idx],
+        "outlier_labels": outlier_labels,
+        "median_uncertainty_us": _median([unc[i] for i in inlier_idx]),
     })
-    if outliers:
-        out["notes"].append("检测到离群事件（|残差|>3×RMS 且 >1ms）：%s；"
-                            "可剔除后重拟合。" % ", ".join(outliers))
-    # 绝对 offset 大是正常的（外置 0 起点 vs X7 绝对 µs），不做「offset<10ms」门槛
-    out["notes"].append("绝对 offset 大小不作为同步判据；验收看校正后残差。")
+
+    if ratio > 3.0:
+        out["status"] = "residual_exceeds_uncertainty"
+        out["notes"].append("内点残差与不确定度之比 %.1f > 3：事件与拟合不一致（或不确定度被低估）"
+                            % ratio)
+    else:
+        out["status"] = "ok"
+
+    out["usable_for_500hz"] = (
+        out["status"] == "ok"
+        and out["residual_rms_us"] <= ALIGN_500HZ_US
+        and out["median_uncertainty_us"] <= ALIGN_500HZ_US)
+    if out["status"] == "ok" and not out["usable_for_500hz"]:
+        out["notes"].append(
+            "零残差但不确定度过大（或残差过大）时不宣称可用于 500 Hz 对齐（阈值 %.0f µs）"
+            % ALIGN_500HZ_US)
+    out["notes"].append("绝对 offset 大小不作为同步判据；验收看校正后残差与不确定度。")
+    if outlier_labels:
+        out["notes"].append("离群事件（稳健拟合剔除）：%s" % ", ".join(outlier_labels))
     return out
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="外置 .bin 与 X7 native FIFO ULog 的软件时间映射（offset+drift+残差）")
     ap.add_argument("--bin", required=True, help="外置原始 .bin（VIB3）")
     ap.add_argument("--ulog", required=True, help="X7 ULog 文件")
-    ap.add_argument("--events", required=True, help="匹配事件 JSON")
+    ap.add_argument("--events", required=True, help="匹配事件 JSON（唯一真源）")
     ap.add_argument("--axis", choices=("accel", "gyro"), default="gyro",
                     help="X7 native FIFO 轴（默认 gyro）")
     ap.add_argument("--instance", type=int, default=0, help="X7 实例（默认 0）")
+    ap.add_argument("--device", type=int, default=None,
+                    help="选定 X7 device_id 段（默认：唯一非 0 device，多个则报错列出）")
     ap.add_argument("--reader", default="auto", help="ULog 读取器（auto/pyulog/native）")
+    ap.add_argument("--max-drift-ppm", type=float, default=DEFAULT_MAX_DRIFT_PPM,
+                    help="合理时钟比上限 ppm（默认 %.0f）" % DEFAULT_MAX_DRIFT_PPM)
+    ap.add_argument("--csv-ext", default=None, help="导出外置逐样本时间轴 CSV")
+    ap.add_argument("--csv-x7", default=None, help="导出 X7 选定段逐样本 CSV")
     ap.add_argument("--json", nargs="?", const="-", default=None,
                     help="输出 JSON（默认 stdout；给路径写文件）")
     args = ap.parse_args(argv)
 
-    ext = read_external_axis(args.bin)
+    # 外置时间轴
+    ext = read_external(args.bin)
+    if ext["errors"]:
+        print("错误：外置 .bin 存在结构错误：%s" % ext["errors"], file=sys.stderr)
+        return 2
+    ext_first = 0.0
+    ext_last = ext["t_end_us"]
+
+    # X7 native FIFO
     content = ulog_reader.load_ulog(args.ulog, reader=args.reader)
     topic = "sensor_%s_fifo" % args.axis
     dataset = content.dataset(topic, args.instance)
@@ -222,12 +494,64 @@ def main(argv=None):
         return 1
 
     report, findings = va.analyze_fifo_dataset(dataset)
-    segments = reconstruct_x7_segments(dataset)
-    spans = x7_timeline_span(segments)
+    segments, seg_stats = reconstruct_x7_segments(dataset)
+    spans = x7_spans(segments)
 
+    # 选定 device：默认唯一非 0 device；多个则要求 --device
+    devices = sorted({s["device_id"] for s in segments if s["packets"]})
+    if args.device is None:
+        if len(devices) == 1:
+            device_id = devices[0]
+        elif len(devices) == 0:
+            print("错误：X7 无有效（非 device=0）连续段，无法映射", file=sys.stderr)
+            return 2
+        else:
+            print("错误：X7 有多个 device_id 段 %s，请用 --device 指定" % devices,
+                  file=sys.stderr)
+            return 2
+    else:
+        device_id = args.device
+        if device_id not in devices:
+            print("错误：--device %d 不在有效 device 段 %s" % (device_id, devices),
+                  file=sys.stderr)
+            return 2
+
+    # 事件
     with open(args.events, "r", encoding="utf-8") as f:
-        events = json.load(f).get("events", [])
-    fit = fit_events(events)
+        raw_events = json.load(f).get("events", [])
+    cleaned, problems = validate_events(raw_events)
+    if problems:
+        for p in problems:
+            print("事件校验失败：%s" % p, file=sys.stderr)
+
+    # 导出外置逐样本时间轴（复用 bin_reader 流式 CSV，含 segment 列）
+    if args.csv_ext:
+        br.BinReader(args.bin, csv_path=args.csv_ext).run()
+
+    # 导出 X7 选定段逐样本 CSV（per-packet scale，物理量带单位）
+    if args.csv_x7:
+        unit, cx, cy, cz = UNIT_BY_AXIS[args.axis]
+        with open(args.csv_x7, "w", encoding="utf-8", newline="") as f:
+            f.write("packet,index_in_packet,t_us,device_id,%s,%s,%s\n" % (cx, cy, cz))
+            for seg in segments:
+                if seg["device_id"] != device_id:
+                    continue
+                for pkt in seg["packets"]:
+                    k = pkt["packet_index"]
+                    n, dt, anchor, scale = pkt["n"], pkt["dt_us"], pkt["anchor_us"], pkt["scale"]
+                    xs = dataset.get("x")
+                    ys = dataset.get("y")
+                    zs = dataset.get("z")
+                    for i in range(n):
+                        t_us = anchor - (n - 1 - i) * dt
+                        x = _sample_value(xs, k, i) * scale
+                        y = _sample_value(ys, k, i) * scale
+                        z = _sample_value(zs, k, i) * scale
+                        f.write("%d,%d,%.3f,%d,%.9g,%.9g,%.9g\n"
+                                % (k, i, t_us, device_id, x, y, z))
+
+    fit = fit_events(cleaned, ext_first, ext_last, segments, device_id,
+                     max_drift_ppm=args.max_drift_ppm)
 
     payload = {
         "external": ext,
@@ -236,9 +560,11 @@ def main(argv=None):
             "reader": content.reader,
             "topic": topic,
             "instance": args.instance,
+            "device_id": device_id,
             "packets": dataset.count,
             "device_segments": spans,
-            "findings": [f.as_dict() for f in findings],
+            "segment_stats": seg_stats,
+            "findings": [fnd.as_dict() for fnd in findings],
         },
         "mapping": fit,
     }
@@ -250,10 +576,9 @@ def main(argv=None):
     else:
         print(text)
 
-    # 退出门槛：能给出 drift 且残差不过大即 0；无事件/退化 2
-    if fit["drift_ppm"] is None and fit["n_events"] > 1:
-        return 2
-    return 0
+    if fit["status"] == "ok":
+        return 0
+    return 2
 
 
 if __name__ == "__main__":

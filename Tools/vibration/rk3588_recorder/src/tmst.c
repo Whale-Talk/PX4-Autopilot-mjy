@@ -31,10 +31,17 @@ void tmst_accum_add(tmst_accum_t *t, uint16_t raw)
     t->prev_raw = raw;
     t->n_samples++;
 
-    if (d <= 0)
-        return;                       /* 重复/倒退样本：不进统计，避免污染速率 */
+    /* d ∈ [0, 65535]（回绕展开后）。d==0 = 重复时间戳（异常）；d>=4096 = 大间隔。
+     * 两者都会让时间轴断裂，必须显式计数、不得静默吞掉（否则丢包/回绕会被
+     * 报告成全程健康）。 */
+    if (d == 0) {
+        t->dup++;
+        t->breaks++;
+        return;
+    }
     if (d >= (int)TMST_HIST_N) {
         t->big++;
+        t->breaks++;
         return;
     }
 
@@ -49,16 +56,24 @@ void tmst_accum_add(tmst_accum_t *t, uint16_t raw)
         t->out_of_window++;
 }
 
+uint64_t tmst_scale_round_u64(uint64_t ticks)
+{
+    const uint64_t num = VIB_TMST_SCALE_NUM;
+    const uint64_t den = VIB_TMST_SCALE_DEN;
+    /* round(ticks * num / den)，先除后乘，避免 ticks*num 溢出；uint64 全程，不截断 */
+    const uint64_t q = ticks / den;
+    const uint64_t r = ticks % den;
+    return q * num + (r * num + den / 2u) / den;
+}
+
 uint64_t tmst_raw_delta_us(uint32_t raw_delta)
 {
-    /* 四舍五入的整数换算：round(raw * num / den) */
-    return ((uint64_t)raw_delta * VIB_TMST_SCALE_NUM + VIB_TMST_SCALE_DEN / 2u)
-           / VIB_TMST_SCALE_DEN;
+    return tmst_scale_round_u64((uint64_t)raw_delta);
 }
 
 uint64_t tmst_accum_total_us(const tmst_accum_t *t)
 {
-    return tmst_raw_delta_us((uint32_t)t->sum_raw_ticks);
+    return tmst_scale_round_u64(t->sum_raw_ticks);
 }
 
 double tmst_accum_rate_hz(const tmst_accum_t *t)
@@ -82,4 +97,9 @@ int tmst_accum_median_raw(const tmst_accum_t *t)
             return (int)i;
     }
     return -1;                        /* 全部落在 big 桶 */
+}
+
+int tmst_accum_untrusted(const tmst_accum_t *t)
+{
+    return (t->dup != 0) || (t->big != 0);
 }

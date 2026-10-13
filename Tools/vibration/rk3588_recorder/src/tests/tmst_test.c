@@ -74,11 +74,68 @@ static void test_wrong_us_assumption(void)
     CHECK(t.out_of_window == t.n_deltas, "Δ=125 全部越窗（117/118 窗口之外）");
 }
 
+static void test_long_total_no_truncation(void)
+{
+    printf("== long total：>2^32 raw ticks 不截断到 uint32 ==\n");
+    /* 直接复现反例：sum_raw_ticks=4,500,000,000 → 应为 4,800,000,000 µs，
+     * 旧实现截断到 uint32 得到 218,701,551。 */
+    tmst_accum_t t;
+    tmst_accum_init(&t);
+    t.sum_raw_ticks = 4500000000ull;
+    CHECK(tmst_accum_total_us(&t) == 4800000000ull,
+          "4.5e9 ticks → 4.8e9 µs（实际 %llu）",
+          (unsigned long long)tmst_accum_total_us(&t));
+
+    /* 走真实累加路径跨过 2^32：每步 Δ=117（117 与 65536 互质），N=40M 样本。
+     * sum_raw_ticks = 117*(N-1) = 4,679,999,883 > 2^32。 */
+    tmst_accum_t a;
+    tmst_accum_init(&a);
+    const uint64_t n = 40000000ull;
+    for (uint64_t i = 0; i < n; i++)
+        tmst_accum_add(&a, (uint16_t)((i * 117ull) & 0xFFFFull));
+    const uint64_t expect_sum = 117ull * (n - 1);
+    CHECK(a.sum_raw_ticks == expect_sum, "整数累加 sum == 117*(N-1)（实际 %llu）",
+          (unsigned long long)a.sum_raw_ticks);
+    CHECK(expect_sum > (1ull << 32), "sum > 2^32（实际 %llu）",
+          (unsigned long long)expect_sum);
+    CHECK(a.big == 0 && a.dup == 0, "全程无重复/大间隔");
+    const uint64_t expect_us = (expect_sum / 30ull) * 32ull
+                             + ((expect_sum % 30ull) * 32ull + 15ull) / 30ull;
+    CHECK(tmst_accum_total_us(&a) == expect_us, "总时间 uint64 换算正确（实际 %llu）",
+          (unsigned long long)tmst_accum_total_us(&a));
+}
+
+static void test_dup_big_untrusted(void)
+{
+    printf("== 重复时间戳 / 大间隔 → 时间轴不可信 ==\n");
+    tmst_accum_t t;
+    tmst_accum_init(&t);
+    tmst_accum_add(&t, 100);
+    tmst_accum_add(&t, 100);                       /* 重复 */
+    CHECK(t.dup == 1, "重复时间戳被计数（dup==1）");
+    CHECK(tmst_accum_untrusted(&t) != 0, "重复 → 不可信");
+
+    tmst_accum_t u;
+    tmst_accum_init(&u);
+    tmst_accum_add(&u, 100);
+    tmst_accum_add(&u, 5000);                      /* 大间隔 */
+    CHECK(u.big == 1, "大间隔被计数（big==1）");
+    CHECK(tmst_accum_untrusted(&u) != 0, "大间隔 → 不可信");
+
+    tmst_accum_t ok;
+    tmst_accum_init(&ok);
+    for (uint64_t i = 0; i < 100; i++)
+        tmst_accum_add(&ok, (uint16_t)((i * 117u) & 0xFFFFu));
+    CHECK(tmst_accum_untrusted(&ok) == 0, "连续 117 序列 → 可信");
+}
+
 int main(void)
 {
     test_nominal_rate();
     test_rollover();
     test_wrong_us_assumption();
+    test_long_total_no_truncation();
+    test_dup_big_untrusted();
     if (failures) {
         fprintf(stderr, "tmst_test: %d 项失败 ❌\n", failures);
         return 1;

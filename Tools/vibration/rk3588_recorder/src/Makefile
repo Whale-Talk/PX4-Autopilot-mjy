@@ -10,7 +10,7 @@ CPPFLAGS ?=
 LDFLAGS ?=
 LDLIBS  ?= -lpthread -lrt
 
-SRC := util.c spi_dev.c icm42688p.c writer.c tmst.c main.c
+SRC := util.c spi_dev.c icm42688p.c writer.c tmst.c run.c main.c
 OBJ := $(SRC:.c=.o)
 BIN := vibrec
 

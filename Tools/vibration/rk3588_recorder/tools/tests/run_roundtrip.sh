@@ -23,7 +23,7 @@ echo "临时区: $OUT"
 echo "--- 1) 严格编译采集程序 ---"
 gcc -O2 -Wall -Wextra -Wshadow -Wconversion -Werror -std=gnu11 \
     -o "$OUT/vibrec" "$SRC/util.c" "$SRC/spi_dev.c" "$SRC/icm42688p.c" \
-    "$SRC/writer.c" "$SRC/tmst.c" "$SRC/main.c" -lpthread -lrt
+    "$SRC/writer.c" "$SRC/tmst.c" "$SRC/run.c" "$SRC/main.c" -lpthread -lrt
 echo "  编译通过（-Werror）"
 
 echo "--- 2) 编译合成数据生成器（复用真实 writer 路径）---"
@@ -85,8 +85,12 @@ gcc -O2 -Wall -Wextra -Wshadow -Wconversion -Werror -std=gnu11 -I"$SRC" \
     "$SRC/spi_dev.c" "$SRC/util.c" "$SRC/tmst.c" -lpthread -lrt
 "$OUT/mock_icm"
 
-echo "--- 10) 启动排空顺序动力学模型（prep>16ms 不溢出 / 错误分支）---"
-python3 "$TESTS/mock_startup_test.py"
+echo "--- 10) 生产启动顺序确定性 mock（实际执行 run.c 的 vib_run，非独立模型）---"
+gcc -O2 -Wall -Wextra -Wshadow -Wconversion -Werror -std=gnu11 -I"$SRC" \
+    -o "$OUT/startup_test" "$SRC/tests/startup_test.c" "$SRC/util.c" \
+    "$SRC/spi_dev.c" "$SRC/icm42688p.c" "$SRC/writer.c" "$SRC/tmst.c" "$SRC/run.c" \
+    -lpthread -lrt
+"$OUT/startup_test"
 
 echo "--- 11) 外置 bin ↔ X7 native FIFO 时间映射（offset+drift+残差）---"
 PYTHONPATH="$ROOT/tools:$VIBDIR" python3 "$TESTS/sync_test.py"

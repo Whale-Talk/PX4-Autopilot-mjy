@@ -231,6 +231,28 @@ void writer_finish(writer_t *w, uint32_t final_lost_total)
     w->ring = NULL;
 }
 
+void writer_abort(writer_t *w)
+{
+    if (!w->ring)
+        return;
+
+    /* 与 writer_finish 的区别：不写结束块。文件在头部之后被截断，是「非正常结束」
+     * 的显式证据；即便已有部分数据块，解析器也会因缺结束块而标记。 */
+    atomic_store_explicit(&w->stop, 1, memory_order_release);
+    pthread_join(w->th, NULL);
+
+    if (w->fd >= 0) {
+        if (fdatasync(w->fd) != 0 && errno != EINVAL)
+            fprintf(stderr, "[writer] 中止收尾 fdatasync 失败: %s\n", strerror(errno));
+        if (close(w->fd) != 0)
+            fprintf(stderr, "[writer] close 失败: %s\n", strerror(errno));
+        w->fd = -1;
+    }
+
+    free(w->ring);
+    w->ring = NULL;
+}
+
 const char *writer_path(const writer_t *w)
 {
     return w->path;

@@ -30,7 +30,9 @@ typedef struct {
     uint64_t sum_raw_ticks;          /* Σ 展开后的 raw Δ（整数，规范真源） */
 
     uint64_t hist[TMST_HIST_N];      /* raw Δ 分布（诊断用） */
-    uint64_t big;                    /* Δ >= TMST_HIST_N 的次数 */
+    uint64_t big;                    /* Δ >= TMST_HIST_N 的次数（大间隔，时间轴在此断裂） */
+    uint64_t dup;                    /* 重复时间戳次数（d==0，异常，不得静默吞掉） */
+    uint64_t breaks;                 /* 时间轴断裂次数（dup 或 big，每处计 1） */
     uint64_t out_of_window;          /* raw Δ 落在 [117,118] 之外的次数 */
     int      dmin;                   /* raw Δ 最小（展开后） */
     int      dmax;                   /* raw Δ 最大（展开后） */
@@ -52,5 +54,13 @@ int tmst_accum_median_raw(const tmst_accum_t *t);
 
 /* 把 raw ticks 差换算成物理 µs（四舍五入到整数），供「换算后物理窗口」判定。 */
 uint64_t tmst_raw_delta_us(uint32_t raw_delta);
+
+/* 把 raw ticks 总量换算成物理 µs（整数四舍五入），uint64 安全，**不截断到 uint32**。
+ * 用「先除后乘」避免 raw*num 溢出；sum 为 Σ 展开后的 raw Δ（可超 2^32）。 */
+uint64_t tmst_scale_round_u64(uint64_t ticks);
+
+/* 时间轴是否可信：出现重复时间戳或大间隔（可能隐藏多回绕、断段）时返回非 0。
+ * 调用方据此把该批次标记为「时间轴不可信」，不得静默当作全程健康。 */
+int tmst_accum_untrusted(const tmst_accum_t *t);
 
 #endif /* VIB_TMST_H */
