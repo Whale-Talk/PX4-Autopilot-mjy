@@ -8,19 +8,22 @@
 # ============================================================================
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../rk3588_recorder/tools/tests
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"                      # .../rk3588_recorder
+VIBDIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"                 # .../Tools/vibration（父目录，含 ulog_reader.py）
 SRC="$ROOT/src"
 TESTS="$ROOT/tools/tests"
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
 echo "工作区: $ROOT"
+echo "振动工具目录: $VIBDIR"
 echo "临时区: $OUT"
 
 echo "--- 1) 严格编译采集程序 ---"
 gcc -O2 -Wall -Wextra -Wshadow -Wconversion -Werror -std=gnu11 \
     -o "$OUT/vibrec" "$SRC/util.c" "$SRC/spi_dev.c" "$SRC/icm42688p.c" \
-    "$SRC/writer.c" "$SRC/main.c" -lpthread -lrt
+    "$SRC/writer.c" "$SRC/tmst.c" "$SRC/main.c" -lpthread -lrt
 echo "  编译通过（-Werror）"
 
 echo "--- 2) 编译合成数据生成器（复用真实 writer 路径）---"
@@ -70,6 +73,23 @@ with open(p, 'rb') as f:
 assert off + total == sz, (off, total, sz)
 print(f"  文件 {sz} B = 256 + {total} B（{nblocks} 个块）✓")
 PY
+
+echo "--- 8) 时间戳换算纯函数测试（raw ticks ×32/30，总 ticks/总时间）---"
+gcc -O2 -Wall -Wextra -Wshadow -Wconversion -Werror -std=gnu11 -I"$SRC" \
+    -o "$OUT/tmst_test" "$SRC/tests/tmst_test.c" "$SRC/tmst.c"
+"$OUT/tmst_test"
+
+echo "--- 9) mock SPI 器件模型：自检 sub-full 不溢出 / INTF_CONFIG0 / 错误分支 ---"
+gcc -O2 -Wall -Wextra -Wshadow -Wconversion -Werror -std=gnu11 -I"$SRC" \
+    -o "$OUT/mock_icm" "$SRC/tests/mock_icm.c" "$SRC/icm42688p.c" \
+    "$SRC/spi_dev.c" "$SRC/util.c" "$SRC/tmst.c" -lpthread -lrt
+"$OUT/mock_icm"
+
+echo "--- 10) 启动排空顺序动力学模型（prep>16ms 不溢出 / 错误分支）---"
+python3 "$TESTS/mock_startup_test.py"
+
+echo "--- 11) 外置 bin ↔ X7 native FIFO 时间映射（offset+drift+残差）---"
+PYTHONPATH="$ROOT/tools:$VIBDIR" python3 "$TESTS/sync_test.py"
 
 echo
 echo "ROUNDTRIP-ALL-OK ✅"

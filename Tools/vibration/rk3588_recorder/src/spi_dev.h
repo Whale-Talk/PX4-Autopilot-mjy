@@ -18,7 +18,7 @@
 /* 一次突发读的上限：FIFO 2 kB + 1 字节地址 */
 #define SPI_SCRATCH_MAX 2049
 
-typedef struct {
+typedef struct spi_dev {
     int      fd;
     uint32_t speed_hz;
     uint8_t  mode;      /* 0 或 3 */
@@ -30,6 +30,10 @@ typedef struct {
     /* 突发读内部暂存，避免热路径 malloc */
     uint8_t  scratch[SPI_SCRATCH_MAX];
     char     path[64];
+    /* 传输注入点：生产代码为 NULL → 走真实 spidev ioctl；单元测试注入 mock。
+     * 协议语义与真实 spidev 一致：tx[0] bit7=1 读、否则写，突发读 tx=[addr|0x80, 0...]。
+     * 这让 icm42688p 的自检/启动逻辑能在无硬件（无 spidev）下被测试。 */
+    int    (*xfer_fn)(struct spi_dev *d, const uint8_t *tx, uint8_t *rx, size_t len);
 } spi_dev_t;
 
 /* 打开并配置 spidev。返回 0 成功，-1 失败（errno 已设置，同时打印原因）。 */

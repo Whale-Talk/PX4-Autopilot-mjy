@@ -69,7 +69,8 @@ void spi_close(spi_dev_t *d)
     }
 }
 
-int spi_xfer(spi_dev_t *d, const uint8_t *tx, uint8_t *rx, size_t len)
+/* 真实 spidev ioctl 传输（生产路径）。单测注入 xfer_fn 时不走这里。 */
+static int spi_xfer_spidev(spi_dev_t *d, const uint8_t *tx, uint8_t *rx, size_t len)
 {
     if (len == 0)
         return 0;
@@ -92,6 +93,13 @@ int spi_xfer(spi_dev_t *d, const uint8_t *tx, uint8_t *rx, size_t len)
         return -1;
     }
     return 0;
+}
+
+int spi_xfer(spi_dev_t *d, const uint8_t *tx, uint8_t *rx, size_t len)
+{
+    if (d->xfer_fn)
+        return d->xfer_fn(d, tx, rx, len);
+    return spi_xfer_spidev(d, tx, rx, len);
 }
 
 int spi_reg_read(spi_dev_t *d, uint8_t reg, uint8_t *val)

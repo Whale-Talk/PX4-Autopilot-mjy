@@ -11,6 +11,7 @@
 #include "icm42688p.h"
 #include "vib_format.h"
 #include "util.h"
+#include "tmst.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -57,12 +58,13 @@ static size_t build_ops(const icm_cfg_t *c, icm_op_t *ops, size_t max)
     OP(ICM_BANK0, ICM_REG_FIFO_CONFIG, 0xFF, 0x40);
     /* INTF_CONFIG0（p.73，复位 0x30）：
      *   bit7 HOLD_LAST_DATA_EN 清 0（无效样本不静默复制上一条）
-     *   bit6 FIFO_COUNT_REC    清 0（计数按字节；除 16 得记录数，且自检会再确认）
-     *   bit5 FIFO_COUNT_ENDIAN 保持 1（大端，与 FIFO_COUNTH/L 的命名一致）
+     *   bit6 FIFO_COUNT_REC    置 1（计数按记录，不再除 16 猜单位）
+     *   bit5 FIFO_COUNT_ENDIAN 置 1（大端，与 FIFO_COUNTH/L 命名一致）
      *   bit4 SENSOR_DATA_ENDIAN 清 0 → 小端（格式规范 §1 要求）
-     *   bits1:0 不动（其编码未在本次提取中确认） */
-    OP(ICM_BANK0, ICM_REG_INTF_CONFIG0, 0xD0, 0x00);
-    /* 记录时间戳：1 µs 分辨率（p.80），8 kHz 下相邻记录 Δ 应为 125 µs */
+     * 整个字节显式写入并回读校验（c->intf_config0 = 0x60）。 */
+    OP(ICM_BANK0, ICM_REG_INTF_CONFIG0, 0xFF, c->intf_config0);
+    /* 记录时间戳：TMST_CONFIG=0x33 → RES=0(名义 1µs) + 内部时钟（无 CLKIN），
+     * Rev 1.6 §12.7：物理 µs = raw_ticks * 32/30，8 kHz 相邻 raw 差 117/118。 */
     OP(ICM_BANK0, ICM_REG_TMST_CONFIG, 0xFF, c->tmst_config);
     /* 以下三个为复位值，显式写出以便回读校验（p.78/p.79/p.80） */
     OP(ICM_BANK0, ICM_REG_GYRO_CONFIG1,        0xFF, 0x16);
@@ -108,6 +110,7 @@ void icm_default_cfg(icm_cfg_t *c)
     c->int_config1      = 0x60;     /* ODR≥4kHz 要求（p.84） */
     c->int_config0      = 0x0A;     /* THS/FULL 在读 FIFO 数据时清除（p.83） */
     c->int_source0      = 0x14;     /* FIFO_THS → INT1（p.84） */
+    c->intf_config0     = 0x60;     /* COUNT_REC=1(按记录)+COUNT_ENDIAN=1(大端)+DATA_ENDIAN=0(小端) */
 }
 
 uint32_t icm_reg_config_hash(const icm_cfg_t *c)
@@ -346,7 +349,7 @@ size_t icm_parse_fifo(const uint8_t *raw, size_t nbytes, vib_record_t *out,
         r.gyro[1]  = (int16_t)((uint16_t)f[9] | ((uint16_t)f[10] << 8));
         r.gyro[2]  = (int16_t)((uint16_t)f[11] | ((uint16_t)f[12] << 8));
         r.temp_raw = f[13];
-        r.tmst_us  = (uint16_t)((uint16_t)f[14] | ((uint16_t)f[15] << 8));
+        r.tmst_raw = (uint16_t)((uint16_t)f[14] | ((uint16_t)f[15] << 8));
 
         if (h & ICM_FIFO_HDR_ODR_ACCEL)
             r.rec_flags |= VIB_RF_ODR_ACCEL_CHG;
@@ -403,72 +406,88 @@ int icm_selftest(icm_t *d, char *report, size_t n)
 
     if (icm_fifo_flush(d) != 0) { APP("[自检] FIFO 清空失败\n"); return -1; }
 
-    /* ---- FIFO 计数单位判定：20 ms @8 kHz 应约 160 条 ----
-     * 不依赖手册里未确认的 FIFO_COUNT_REC 语义，直接用实测反推。 */
-    sleep_us(20000);
-    uint16_t raw = 0;
-    if (icm_fifo_count_raw(d, &raw) != 0) { APP("[自检] 读 FIFO_COUNT 失败\n"); return -1; }
-    int expect_rec = (int)(d->cfg.odr_hz / 50);          /* 20 ms */
-    if (raw >= (uint16_t)(expect_rec * 8) && raw % 16 == 0) {
-        d->count_div = 16;
-        APP("[自检] FIFO_COUNT 单位=字节（raw=%u ≈ %d 条）✅\n", raw, raw / 16);
-    } else if (raw > 0 && raw <= (uint16_t)(expect_rec * 2)) {
+    /* ---- 读回 INTF_CONFIG0：显式确认 FIFO_COUNT 单位与端序（不靠 20 ms 猜） ---- */
+    uint8_t intf0 = 0;
+    if (reg_read_any(d, ICM_BANK0, ICM_REG_INTF_CONFIG0, &intf0) != 0) {
+        APP("[自检] 读回 INTF_CONFIG0 失败\n");
+        return -1;
+    }
+    d->count_endian = (intf0 & ICM_INTF0_COUNT_ENDIAN) ? 1 : 0;
+    if (intf0 & ICM_INTF0_COUNT_REC) {
         d->count_div = 1;
-        APP("[自检] FIFO_COUNT 单位=记录（raw=%u ≈ %d 条）✅\n", raw, raw);
+        APP("[自检] INTF_CONFIG0=0x%02X：FIFO_COUNT 按记录计数、%s端 ✅\n",
+            intf0, d->count_endian ? "大" : "小");
     } else {
         d->count_div = 16;
-        APP("[自检] FIFO_COUNT=%u 与 20 ms@8kHz(≈%d 条) 不符，暂按字节处理 ⚠️\n",
-            raw, expect_rec);
+        APP("[自检] INTF_CONFIG0=0x%02X：FIFO_COUNT 按字节计数（除 16）、%s端\n",
+            intf0, d->count_endian ? "大" : "小");
+    }
+    if (intf0 & ICM_INTF0_DATA_ENDIAN) {
+        APP("[自检] SENSOR_DATA_ENDIAN=1（大端），与格式规范要求的小端不符 ❌\n");
         fail = 1;
     }
 
-    /* ---- 采样时间戳校验：8 kHz 下 Δtmst 中位数应为 125 µs ---- */
-    uint16_t nrec = (uint16_t)(raw / (uint16_t)d->count_div);
+    /* ---- 清 FIFO + 丢包基线 ---- */
+    uint32_t lost0 = 0, lost1 = 0;
+    if (icm_read_lost(d, &lost0) != 0) { APP("[自检] 读 FIFO_LOST_PKT 基线失败\n"); return -1; }
+
+    /* ---- sub-full 窗口采样：4 ms@8kHz ≈ 32 条，远小于 16 ms 满窗，不会主动溢出 ---- */
+    sleep_us(ICM_SELFTEST_WINDOW_US);
+    uint16_t raw = 0;
+    if (icm_fifo_count_raw(d, &raw) != 0) { APP("[自检] 读 FIFO_COUNT 失败\n"); return -1; }
+    if (icm_read_lost(d, &lost1) != 0) { APP("[自检] 读 FIFO_LOST_PKT 失败\n"); return -1; }
+    if (lost1 != lost0) {
+        APP("[自检] 4 ms 窗口内 FIFO_LOST_PKT 增长 %u→%u（自检不应主动溢出）❌\n",
+            lost0, lost1);
+        fail = 1;
+    }
+
+    int nrec = (int)(raw / (uint16_t)d->count_div);
+    const int expect_min = (int)(d->cfg.odr_hz / 500);   /* 2 ms 下限，容忍调度抖动 */
+    const int expect_max = (int)(d->cfg.odr_hz / 160);   /* 6.25 ms 上限 */
+    if (nrec < expect_min || nrec > expect_max) {
+        APP("[自检] 4 ms 窗口 FIFO_COUNT=%u → %d 条，偏离 8 kHz 预期（%d..%d）⚠️\n",
+            raw, nrec, expect_min, expect_max);
+        fail = 1;
+    }
+
+    /* ---- 采样时间戳校验：raw Δ 应为 117/118（物理 125 µs），绝不是 125 ---- */
     if (nrec < 8) {
-        APP("[自检] 20 ms 内记录数不足（%u），无法校验时间戳 ❌\n", nrec);
+        APP("[自检] 记录数不足（%d），无法校验时间戳 ❌\n", nrec);
         return -1;
     }
-    if (nrec > VIB_SAMPLES_PER_BLOCK)
-        nrec = VIB_SAMPLES_PER_BLOCK;
+    int nread = nrec;
+    if (nread > VIB_SAMPLES_PER_BLOCK)
+        nread = VIB_SAMPLES_PER_BLOCK;
 
     uint8_t  rawbuf[VIB_SAMPLES_PER_BLOCK * VIB_RECORD_SIZE];
     vib_record_t recs[VIB_SAMPLES_PER_BLOCK];
-    if (icm_read_fifo(d, rawbuf, (size_t)nrec * VIB_RECORD_SIZE) != 0) {
+    if (icm_read_fifo(d, rawbuf, (size_t)nread * VIB_RECORD_SIZE) != 0) {
         APP("[自检] 读 FIFO 数据失败\n");
         return -1;
     }
     uint32_t bad = 0;
-    size_t got = icm_parse_fifo(rawbuf, (size_t)nrec * VIB_RECORD_SIZE, recs,
+    size_t got = icm_parse_fifo(rawbuf, (size_t)nread * VIB_RECORD_SIZE, recs,
                                 VIB_SAMPLES_PER_BLOCK, &bad);
-    int hist[VIB_TMST_NOMINAL_US * 2 + 3];
-    memset(hist, 0, sizeof(hist));
-    int dmin = 1 << 20, dmax = -(1 << 20), dcnt = 0;
-    for (size_t i = 1; i < got; i++) {
-        int dlt = (int)recs[i].tmst_us - (int)recs[i - 1].tmst_us;
-        if (dlt < 0)
-            dlt += (int)VIB_TMST_WRAP;      /* 回绕展开（数据格式规范 §4） */
-        if (dlt > 0 && dlt < (int)(sizeof(hist) / sizeof(hist[0]))) {
-            hist[dlt]++;
-            dcnt++;
-            if (dlt < dmin) dmin = dlt;
-            if (dlt > dmax) dmax = dlt;
-        }
-    }
-    int median = -1, acc = 0;
-    for (size_t i = 0; i < sizeof(hist) / sizeof(hist[0]); i++) {
-        acc += hist[i];
-        if (dcnt && acc * 2 >= dcnt) { median = (int)i; break; }
-    }
-    APP("[自检] 解析 %zu 条记录，包头异常 %u 条；Δtmst: 中位=%d µs 范围=[%d,%d] µs\n",
-        got, bad, median, dcnt ? dmin : 0, dcnt ? dmax : 0);
-    if (median < 0) {
-        APP("[自检] 无法得到 Δtmst ❌\n");
+
+    tmst_accum_t ta;
+    tmst_accum_init(&ta);
+    for (size_t i = 0; i < got; i++)
+        tmst_accum_add(&ta, recs[i].tmst_raw);
+    const int median_raw = tmst_accum_median_raw(&ta);
+    APP("[自检] 解析 %zu 条记录，包头异常 %u 条；raw Δ: 中位=%d（预期 117/118）范围=[%d,%d]\n",
+        got, bad, median_raw, ta.n_deltas ? ta.dmin : 0, ta.n_deltas ? ta.dmax : 0);
+    if (median_raw < 0) {
+        APP("[自检] 无法得到 raw Δ ❌\n");
         fail = 1;
-    } else if (median < (int)VIB_TMST_NOMINAL_US - 2 || median > (int)VIB_TMST_NOMINAL_US + 2) {
-        APP("[自检] Δtmst 中位数 %d µs 偏离 125 µs（ODR/时间戳配置可疑）❌\n", median);
+    } else if (median_raw < (int)VIB_TMST_RAW_LO || median_raw > (int)VIB_TMST_RAW_HI) {
+        APP("[自检] raw Δ 中位数 %d 偏离 117/118（若≈125 说明把 raw ticks 当 µs 了）❌\n",
+            median_raw);
         fail = 1;
     } else {
-        APP("[自检] Δtmst 符合 8 kHz 预期（实测 ODR ≈ %.1f Hz）✅\n", 1e6 / (double)median);
+        APP("[自检] raw Δ 符合 8 kHz 预期（≈%.1f µs → 实测 ODR ≈ %.1f Hz）✅\n",
+            (double)median_raw * (double)VIB_TMST_SCALE_NUM / (double)VIB_TMST_SCALE_DEN,
+            tmst_accum_rate_hz(&ta));
     }
     if (bad)
         fail = 1;

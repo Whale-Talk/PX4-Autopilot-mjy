@@ -28,6 +28,10 @@
 #define ICM_REG_FIFO_DATA          0x30  /* p.60 */
 #define ICM_REG_SIGNAL_PATH_RESET  0x4B  /* p.61 bit2 FIFO_FLUSH */
 #define ICM_REG_INTF_CONFIG0       0x4C  /* p.73 复位 0x30：bit7 HOLD_LAST bit6 COUNT_REC bit5 COUNT_ENDIAN bit4 DATA_ENDIAN */
+#define ICM_INTF0_HOLD_LAST        0x80  /* bit7 无效样本静默复制上一条（本实现清 0） */
+#define ICM_INTF0_COUNT_REC        0x40  /* bit6 1=FIFO_COUNT 按记录计数 */
+#define ICM_INTF0_COUNT_ENDIAN     0x20  /* bit5 1=FIFO_COUNT 大端（先 COUNTH 后 COUNTL） */
+#define ICM_INTF0_DATA_ENDIAN      0x10  /* bit4 0=传感器数据小端 */
 #define ICM_REG_INTF_CONFIG1       0x4D  /* p.74 复位 0x91：bit2 RTC_MODE bit1:0 CLKSEL */
 #define ICM_REG_PWR_MGMT0          0x4E  /* p.75 复位 0x00：bit5 TEMP_DIS bit4 IDLE bit3:2 GYRO_MODE bit1:0 ACCEL_MODE */
 #define ICM_REG_GYRO_CONFIG0       0x4F  /* p.76 复位 0x06：[7:5] FS [3:0] ODR */
@@ -100,7 +104,8 @@ typedef struct {
      * 手册 p.79：档 1 → max(400, ODR)/4 = 2000 Hz @8kHz（名义值） */
     uint8_t  ui_filt_bw_nibble; /* 1 */
     /* FIFO 记录时间戳：TMST_CONFIG 期望值
-     * 0x33 = 保留位5=1 | TO_REGS=1 | RES=0(1µs) | DELTA=0 | FSYNC=1 | EN=1（p.80） */
+     * 0x33 = 保留位5=1 | TO_REGS=1 | RES=0(1µs) | DELTA=0 | FSYNC=1 | EN=1（p.80）
+     * RES=0 + 内部时钟（无 CLKIN）：Rev 1.6 §12.7 规定物理 µs = raw_ticks * 32/30。 */
     uint8_t  tmst_config;
     /* INT_CONFIG1：ODR ≥ 4kHz 时手册 p.84 明确要求
      * bit6 TPULSE=1(8µs) 且 bit5 TDEASSERT_DISABLE=1，并把 bit4 ASYNC_RESET 由默认 1 改为 0
@@ -110,14 +115,22 @@ typedef struct {
     uint8_t  int_config0;
     /* INT_SOURCE0：bit2 使能 FIFO_THS→INT1（p.84） */
     uint8_t  int_source0;
+    /* INTF_CONFIG0（p.73）：0x60 = COUNT_REC=1(按记录) + COUNT_ENDIAN=1(大端)，
+     * 同时 DATA_ENDIAN=0(小端)、HOLD_LAST=0。写入后回读校验，不靠猜。 */
+    uint8_t  intf_config0;
 } icm_cfg_t;
+
+/* 自检里「等一小段再看计数」的窗口：4 ms@8kHz ≈ 32 条，远小于 16 ms 满窗，
+ * 不会像旧版 20 ms 等待那样主动把 FIFO 灌满。 */
+#define ICM_SELFTEST_WINDOW_US 4000u
 
 typedef struct {
     spi_dev_t *spi;
     icm_cfg_t  cfg;
     uint8_t    who_am_i;
     uint32_t   reg_hash;       /* 写入序列的 FNV-1a，落进文件头 */
-    int        count_div;      /* FIFO_COUNT 换算成记录数的除数：16（字节）或 1（记录），自检判定 */
+    int        count_div;      /* FIFO_COUNT 换算成记录数的除数：1（记录）或 16（字节），回读判定 */
+    uint8_t    count_endian;   /* FIFO_COUNT 端序（回读 INTF_CONFIG0 bit5）：1=大端 */
     uint32_t   lost_total;     /* 最近一次读到的 FIFO_LOST_PKT 累计 */
     uint64_t   records_total;
     uint32_t   fifo_full_events;
@@ -134,8 +147,9 @@ int icm_read_whoami(icm_t *d, uint8_t *id);
 int icm_apply_config(icm_t *d);
 int icm_verify_config(icm_t *d, char *report, size_t n);
 
-/* 自检：软复位 → ID → 配置 → 回读比对 → FIFO 计数单位判定 → 20 ms 采样并检查 Δtmst
- * 返回 0 全部通过；report 里写人类可读结论（会被写进运行日志）。 */
+/* 自检：软复位 → ID → 配置 → 回读比对（含 INTF_CONFIG0 的 COUNT_REC/COUNT_ENDIAN）
+ * → 清 FIFO → 4 ms sub-full 窗口采样 → 校验 FIFO_COUNT 单位 + 丢包 Δ==0 + Δtmst(raw 117/118)。
+ * 返回 0 全部通过；report 里写人类可读结论（会被写进运行日志）。失败应中止采集。 */
 int icm_selftest(icm_t *d, char *report, size_t n);
 
 int icm_fifo_flush(icm_t *d);

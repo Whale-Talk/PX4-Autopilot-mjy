@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-bin_reader.py — 原始震动数据（格式 v2）解析/校验/统计工具
+bin_reader.py — 原始震动数据（格式 v3）解析/校验/统计工具
 
 真源文档：../02_原始震动采集器/02_采集软件/数据格式规范.md
 机器可读定义：../02_原始震动采集器/02_采集软件/src/vib_format.h
@@ -9,8 +9,9 @@ bin_reader.py — 原始震动数据（格式 v2）解析/校验/统计工具
 职责：
   1) 结构校验：magic / version / 尺寸 / 文件头与每个块的 CRC
   2) 完整性判定：block_index 缺号（主机丢块）、FIFO_LOST_PKT 增长（器件丢包）、
-     包头 flag（FIFO 满 / 短读）、削顶与无效样本比例
-  3) 时间基准：tmst 16 位回绕展开、Δtmst 分布、**实测 ODR**
+     包头 flag（FIFO 满 / 短读 / SPI 读错）、削顶与无效样本比例
+  3) 时间基准：tmst 16-bit raw ticks 回绕展开、×32/30 换算物理 µs、
+     「总 ticks/总时间」实测 ODR（不用 1e6/median）
   4) 物理量：按 ±16 g / ±2000 dps 换算（手册 p.11/p.12），给出各轴 RMS/峰值
   5) 导出：--csv 写逐样本物理量（流式，内存恒定）
 
@@ -29,7 +30,7 @@ from collections import Counter
 
 # ---------------------------------------------------------------- 常量（与 vib_format.h 对齐）
 MAGIC = b"VIB2"
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 FILE_HEADER_SIZE = 256
 BLOCK_HEADER_SIZE = 32
 RECORD_SIZE = 16
@@ -40,14 +41,17 @@ BLOCK_TYPE_END = 0xFFFF
 
 CLIP_THRESHOLD = 32760          # |raw| >= 32760 判削顶
 INVALID_SENTINEL = -32766       # 器件「无效样本」哨兵
-TMST_WRAP = 65536               # 16 位 µs 回绕
-TMST_NOMINAL_US = 125           # 8 kHz 名义 Δtmst
-TMST_TOL_US = 1
+TMST_WRAP = 65536               # 16-bit raw ticks 回绕
+TMST_SCALE_NUM = 32             # raw ticks → µs 分子（Rev 1.6 §12.7）
+TMST_SCALE_DEN = 30             # raw ticks → µs 分母
+TMST_US_NOMINAL = 125           # 8 kHz 名义物理 Δ（µs，换算后）
+TMST_RAW_LO = 117               # 8 kHz 相邻 raw Δ 窗口下界
+TMST_RAW_HI = 118               # 8 kHz 相邻 raw Δ 窗口上界
 
 LSB_PER_G = 2048.0              # ±16 g（手册 p.11）
 LSB_PER_DPS = 16.4              # ±2000 dps（手册 p.12）
 
-FILE_HDR_FMT = "<4sHHIIIIHHHHQQBB6sQ188sI"
+FILE_HDR_FMT = "<4sHHIIIIHHHHQQBB6sQHHBBBBI176sI"
 FILE_HDR_SIZE_CHECK = struct.calcsize(FILE_HDR_FMT)
 BLOCK_HDR_FMT = "<HH IQIHHII".replace(" ", "")
 BLOCK_HDR_SIZE_CHECK = struct.calcsize(BLOCK_HDR_FMT)
@@ -62,6 +66,7 @@ REC_FLAG_HEADER_MSG = 0x08
 BLOCK_FLAG_FIFO_FULL = 0x0001
 BLOCK_FLAG_SHORT_READ = 0x0002
 BLOCK_FLAG_WRITE_RETRY = 0x0004
+BLOCK_FLAG_SPI_ERR = 0x0008
 
 AXES = ("ax", "ay", "az", "gx", "gy", "gz")
 
@@ -143,6 +148,7 @@ class BinReader:
         self.lost_pkt_steps = 0
         self.fifo_full_blocks = 0
         self.short_blocks = 0
+        self.spi_err_blocks = 0
         self.crc_block_errors = 0
         self.tmst_hist = Counter()
         self.tmst_big = 0
@@ -150,7 +156,11 @@ class BinReader:
         self.tmst_min = None
         self.tmst_max = None
         self.prev_tmst = None
-        self.tmst_abs_us = 0            # 展开后的绝对时间轴
+        self.tmst_raw_total = 0        # Σ 展开后的 raw Δ（整数，规范真源）
+        self.tmst_n_deltas = 0         # 参与速率估计的 Δ 数（d ∈ [1,4096)）
+        self.tmst_abs_us = 0.0         # 展开后的物理绝对时间轴（µs，浮点，供 CSV）
+        self.ticks_to_us_num = TMST_SCALE_NUM
+        self.ticks_to_us_den = TMST_SCALE_DEN
         self.end_block_seen = False
         self.axes = {a: RunningStat() for a in AXES}
         self.temp_c = RunningStat()
@@ -164,8 +174,9 @@ class BinReader:
             raise VibFormatError(f"magic 不是 {MAGIC!r}，而是 {raw[:4]!r}（格式不符或文件损坏）")
 
         (magic, ver, hsz, flags, drv, reg_hash, odr, fs_a, fs_g, recb, _res0,
-         t_mono, t_utc, who, frame, res1, samples_exp, res2, crc) = struct.unpack(
-            FILE_HDR_FMT, raw)
+         t_mono, t_utc, who, frame, res1, samples_exp,
+         tmst_scale_num, tmst_scale_den, tmst_source, tmst_res,
+         count_unit, count_endian, flags2, res2, crc) = struct.unpack(FILE_HDR_FMT, raw)
 
         stored = zlib.crc32(raw[:252])
         if stored != crc:
@@ -178,6 +189,17 @@ class BinReader:
             self.anomalies.append(f"format_version={ver}，本工具面向 v{FORMAT_VERSION}")
         if any(res2):
             self.anomalies.append("文件头 reserved2 非全 0（写入实现与文档不一致）")
+
+        # ---- 时间戳换算：v3 带显式 scale；legacy v2 把 raw ticks 当 µs（旧假设） ----
+        if ver >= 3 and tmst_scale_num > 0 and tmst_scale_den > 0:
+            self.ticks_to_us_num = tmst_scale_num
+            self.ticks_to_us_den = tmst_scale_den
+        else:
+            self.ticks_to_us_num = 1
+            self.ticks_to_us_den = 1
+            self.anomalies.append(
+                "时间戳换算 scale 缺失/为 0：按 raw=µs 处理。这对应 legacy v2 的旧假设，"
+                "物理时间轴不可信（Rev 1.6 §12.7 要求 µs = raw*32/30）")
 
         self.fh = {
             "magic": magic.decode("ascii", "replace"),
@@ -195,6 +217,12 @@ class BinReader:
             "who_am_i": f"0x{who:02X}",
             "frame": frame,
             "sample_count_expected": samples_exp,
+            "tmst_scale_num": tmst_scale_num,
+            "tmst_scale_den": tmst_scale_den,
+            "tmst_source": tmst_source,
+            "tmst_res": tmst_res,
+            "count_unit": count_unit,
+            "count_endian": count_endian,
             "crc32_ok": stored == crc,
         }
         if who != 0x47:
@@ -265,6 +293,8 @@ class BinReader:
                     self.fifo_full_blocks += 1
                 if bflags & BLOCK_FLAG_SHORT_READ:
                     self.short_blocks += 1
+                if bflags & BLOCK_FLAG_SPI_ERR:
+                    self.spi_err_blocks += 1
 
                 if btype == BLOCK_TYPE_END:
                     self.end_block_seen = True
@@ -295,21 +325,27 @@ class BinReader:
                         self.bad_records += 1
                         continue
 
-                    # 时间戳展开
+                    # 时间戳展开：16-bit raw ticks 回绕；物理 µs = raw * 32/30（累加分数）
                     if self.prev_tmst is not None:
                         d = tmst - self.prev_tmst
                         if d < 0:
                             d += TMST_WRAP
-                        self.tmst_hist[d if d < 4096 else -1] += 1
+                        if d <= 0:
+                            self.prev_tmst = tmst
+                            continue
                         if d >= 4096:
                             self.tmst_big += 1
-                        if abs(d - TMST_NOMINAL_US) > TMST_TOL_US:
-                            self.tmst_out_of_window += 1
-                        self.tmst_abs_us += d
-                        if self.tmst_min is None or d < self.tmst_min:
-                            self.tmst_min = d
-                        if self.tmst_max is None or d > self.tmst_max:
-                            self.tmst_max = d
+                        else:
+                            self.tmst_raw_total += d
+                            self.tmst_n_deltas += 1
+                            self.tmst_hist[d] += 1
+                            if d < TMST_RAW_LO or d > TMST_RAW_HI:
+                                self.tmst_out_of_window += 1
+                            if self.tmst_min is None or d < self.tmst_min:
+                                self.tmst_min = d
+                            if self.tmst_max is None or d > self.tmst_max:
+                                self.tmst_max = d
+                            self.tmst_abs_us += d * self.ticks_to_us_num / self.ticks_to_us_den
                     self.prev_tmst = tmst
 
                     # 物理量
@@ -354,6 +390,9 @@ class BinReader:
                                   "（采样期间排空不及，存在不可恢复的器件丢包）")
         if self.short_blocks:
             self.anomalies.append(f"{self.short_blocks} 个块为短读（未达水位即排空）")
+        if self.spi_err_blocks:
+            self.anomalies.append(f"{self.spi_err_blocks} 个块 status/lost 读取失败"
+                                  "（FIFO 健康未知，不能当作 0 丢包）")
         device_lost = (self.lost_pkt_last or 0) - (self.lost_pkt_first or 0)
         if device_lost > 0:
             self.anomalies.append(f"器件 FIFO_LOST_PKT 增长 {device_lost} 条"
@@ -370,17 +409,20 @@ class BinReader:
 
     # ------------------------------------------------------------------ 汇总
     def _finalize(self, device_lost: int, clip_ratio: float) -> None:
-        n_delta = max(self.records - 1, 0)
-        median = None
+        # 实测 ODR 用「总 raw ticks / 总物理时间」估计，不用 1e6/median
+        # （对 117/118 抖动更稳健，且保留全程信息；与 C 端 tmst.c 一致）。
+        n_delta = self.tmst_n_deltas
+        median_raw = None
         if n_delta:
             acc = 0
             for d in sorted(k for k in self.tmst_hist if k >= 0):
                 acc += self.tmst_hist[d]
                 if acc * 2 >= n_delta:
-                    median = d
+                    median_raw = d
                     break
-        measured_odr = (1e6 / median) if median else None
-        duration_s = self.tmst_abs_us / 1e6 if self.records else 0.0
+        total_us = self.tmst_raw_total * self.ticks_to_us_num / self.ticks_to_us_den
+        measured_odr = (n_delta * 1e6 / total_us) if total_us > 0 and n_delta else None
+        duration_s = total_us / 1e6 if total_us else 0.0
 
         self.stats = {
             "file": self.path,
@@ -397,6 +439,7 @@ class BinReader:
                 "device_lost_pkt_delta": device_lost,
                 "fifo_full_blocks": self.fifo_full_blocks,
                 "short_blocks": self.short_blocks,
+                "spi_err_blocks": self.spi_err_blocks,
                 "bad_record_flags": self.bad_records,
                 "invalid_flag_records": self.invalid_flag_records,
                 "odr_change_records": self.odr_change_records,
@@ -407,14 +450,16 @@ class BinReader:
             },
             "timing": {
                 "duration_s": round(duration_s, 6),
-                "tmst_median_us": median,
+                "tmst_median_raw": median_raw,
+                "tmst_median_us": round(median_raw * self.ticks_to_us_num / self.ticks_to_us_den, 3)
+                    if median_raw else None,
                 "measured_odr_hz": round(measured_odr, 3) if measured_odr else None,
                 "nominal_odr_hz": self.fh.get("odr_hz_nominal"),
                 "odr_error_ppm": (round((measured_odr - self.fh["odr_hz_nominal"])
                                         / self.fh["odr_hz_nominal"] * 1e6, 1)
                                   if measured_odr and self.fh.get("odr_hz_nominal") else None),
-                "tmst_min_us": self.tmst_min,
-                "tmst_max_us": self.tmst_max,
+                "tmst_raw_min": self.tmst_min,
+                "tmst_raw_max": self.tmst_max,
                 "tmst_out_of_window": self.tmst_out_of_window,
                 "tmst_out_of_window_ratio": (
                     round(self.tmst_out_of_window / n_delta, 8) if n_delta else 0.0),
@@ -443,10 +488,10 @@ class BinReader:
         p(f"记录数    : {ig['records']}   块数: {ig['blocks']}   "
           f"时长: {tm['duration_s']:.3f} s   实测ODR: {tm['measured_odr_hz']} Hz "
           f"(偏差 {tm['odr_error_ppm']} ppm)")
-        p(f"Δtmst     : 中位 {tm['tmst_median_us']} µs  范围 "
-          f"[{tm['tmst_min_us']}, {tm['tmst_max_us']}] µs  "
+        p(f"raw Δ     : 中位 {tm['tmst_median_raw']}（≈{tm['tmst_median_us']} µs）  范围 "
+          f"[{tm['tmst_raw_min']}, {tm['tmst_raw_max']}]  "
           f"越窗 {tm['tmst_out_of_window']} ({tm['tmst_out_of_window_ratio']:.4%})  "
-          f"离群(≥4096µs) {tm['tmst_big_delta']}")
+          f"离群(≥4096) {tm['tmst_big_delta']}")
         p(f"丢包      : 器件 FIFO_LOST_PKT {ig['device_lost_pkt_first']} → "
           f"{ig['device_lost_pkt_last']} (Δ{ig['device_lost_pkt_delta']})   "
           f"主机缺块 {ig['missing_blocks']}({ig['block_index_gaps']} 处)   "

@@ -88,11 +88,14 @@ def main():
 
     # ---- 头部与结构 ----
     check(h["magic"] == "VIB2", "文件头 magic=VIB2")
-    check(h["format_version"] == 2, "format_version=2")
+    check(h["format_version"] == 3, "format_version=3")
     check(h["crc32_ok"], "文件头 CRC 与 C 端一致（zlib.crc32 == vib_crc32）")
     check(h["who_am_i"] == "0x47", "who_am_i=0x47")
     check(h["reg_config_hash"] == 0xDEADBEEF, "reg_config_hash 原样回读")
     check(h["t_start_utc_ns"] == 1750000000000000000, "t_start_utc_ns 原样回读")
+    check(h["tmst_scale_num"] == 32 and h["tmst_scale_den"] == 30,
+          "时间戳换算元数据 scale=32/30（Rev 1.6 §12.7）")
+    check(h["tmst_source"] == 0, "tmst_source=0（内部时钟，无 CLKIN）")
     check(ig["end_block_seen"], "读到结束块")
 
     # ---- 计数与布局 ----
@@ -102,12 +105,16 @@ def main():
           f"(实际 {ig['blocks']})")
 
     # ---- 时间基准 ----
-    check(tm["tmst_median_us"] == 125, "Δtmst 中位 == 125 µs")
-    check(tm["measured_odr_hz"] == 8000.0, f"实测 ODR == 8000 Hz",
+    check(tm["tmst_median_raw"] == 117, "raw Δ 中位 == 117（不是 125）",
+          f"(实际 {tm['tmst_median_raw']})")
+    check(abs(tm["measured_odr_hz"] - 8000.0) < 1.0, "实测 ODR ≈ 8000 Hz（总 ticks/总时间）",
           f"(实际 {tm['measured_odr_hz']})")
-    check(tm["tmst_out_of_window"] == 0, "Δtmst 无越窗（16 位回绕被正确展开）")
-    check(tm["duration_s"] == (a.seconds * 8000 - 1) * 125 / 1e6,
-          "时间轴长度 == (n-1)*125 µs", f"(实际 {tm['duration_s']})")
+    check(tm["tmst_out_of_window"] == 0, "raw Δ 无越窗（16 位回绕被正确展开）")
+    # 独立复算：sum_raw = floor((nrec-1) * 125*30/32)，duration = sum_raw * 32/30 / 1e6
+    sum_raw = (a.seconds * 8000 - 1) * 125 * 30 // 32
+    duration_expected = sum_raw * 32 / 30 / 1e6
+    check(abs(tm["duration_s"] - duration_expected) < 1e-6,
+          "时间轴长度 == ΣrawΔ × 32/30", f"(实际 {tm['duration_s']} vs {duration_expected})")
 
     # ---- 物理量与削顶 ----
     check(ig["clip_records"] == exp["clips"], f"削顶记录数 == {exp['clips']}",

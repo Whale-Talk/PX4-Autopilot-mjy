@@ -113,3 +113,6 @@ keys/
 # Local vibration research and planning documents
 /docs/vibration/*.md
 /Tools/vibration/*.md
+/Tools/vibration/rk3588_recorder/**/*.md
+/Tools/vibration/rk3588_recorder/src/vibrec
+/Tools/vibration/rk3588_recorder/src/*.o

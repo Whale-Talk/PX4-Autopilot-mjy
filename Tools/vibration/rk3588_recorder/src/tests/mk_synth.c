@@ -11,7 +11,8 @@
  *   accel[1] = -2000   accel[2] = 2048
  *   gyro[0]  = 164     gyro[1]  = 0     gyro[2] = -16
  *   temp_raw = 21      rec_flags = 0
- *   tmst_us  = (i * 125) & 0xFFFF     （严格 8 kHz，必然经历多次 16 位回绕）
+ *   tmst_raw = (i * 125*30/32) & 0xFFFF  （严格 8 kHz：物理 125 µs/样本 →
+ *               raw ticks 117/118 交替，经历多次 16 位回绕）
  *   每 32 条一数据块；lost_pkt_total = 0
  *
  * 用法: mk_synth OUT.bin SECONDS [--gap] [--badcrc] [--clip-every N]
@@ -66,6 +67,12 @@ int main(int argc, char **argv)
     fh.fs_accel_g            = 16;
     fh.fs_gyro_dps           = 2000;
     fh.sample_count_expected = nrec;
+    fh.tmst_scale_num        = VIB_TMST_SCALE_NUM;
+    fh.tmst_scale_den        = VIB_TMST_SCALE_DEN;
+    fh.tmst_source           = VIB_TMST_SOURCE_INTERNAL;
+    fh.tmst_res              = VIB_TMST_RES_1US;
+    fh.count_unit            = 1;      /* COUNT_REC=1（按记录） */
+    fh.count_endian          = 1;      /* 大端 */
 
     writer_t w;
     if (writer_start(&w, out, &fh, 0, 0) != 0)
@@ -91,7 +98,9 @@ int main(int argc, char **argv)
             r.gyro[1]  = 0;
             r.gyro[2]  = -16;
             r.temp_raw = 21;
-            r.tmst_us  = (uint16_t)((i * VIB_TMST_NOMINAL_US) & 0xFFFFu);
+            r.tmst_raw = (uint16_t)(((uint64_t)i * (uint64_t)VIB_TMST_US_NOMINAL
+                                      * (uint64_t)VIB_TMST_SCALE_DEN
+                                      / (uint64_t)VIB_TMST_SCALE_NUM) & 0xFFFFull);
             r.rec_flags = 0;
             for (int a = 0; a < 3; a++) {
                 if (r.accel[a] >= VIB_CLIP_THRESHOLD || r.accel[a] <= -VIB_CLIP_THRESHOLD) {

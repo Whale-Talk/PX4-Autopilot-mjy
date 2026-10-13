@@ -1,7 +1,7 @@
 /* ============================================================================
  * main.c — 原始震动采集程序（香橙派 5 Pro + ICM-42688-P）
  *
- * 目标：8 kHz 连续排空 ICM-42688-P 的 FIFO，按 `数据格式规范.md` v2 落盘。
+ * 目标：8 kHz 连续排空 ICM-42688-P 的 FIFO，按 `数据格式规范.md` v3 落盘。
  *
  * 线程模型：
  *   主线程      = 采集（SCHED_FIFO + 绑核）：只做 FIFO 排空 + 序列化 + 投递
@@ -9,6 +9,11 @@
  *
  * 为什么主线程不写盘：fdatasync 会造成毫秒级停顿，而 8 kHz 下 FIFO 仅 16 ms
  * 窗口，一次停顿就可能溢出。所有 I/O 交给 writer 线程，主线程只投递内存块。
+ *
+ * 时间戳口径：记录内 16-bit 是 raw ticks，物理 µs = raw_ticks * 32/30
+ * （TDK DS-000347 Rev 1.6 §12.7）。8 kHz 相邻 raw Δ 为 117/118（不是 125）。
+ * 速率用「总 raw ticks / 总时间」估计，不用 1e6/median。
+ * 当前主循环是纯轮询（FIFO_COUNT + sleep），未接 GPIO 中断线，勿宣称 IRQ 驱动。
  * ==========================================================================*/
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -28,8 +33,7 @@
 #include "spi_dev.h"
 #include "icm42688p.h"
 #include "writer.h"
-
-#define TMST_HIST_N 4096
+#include "tmst.h"
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int s) { (void)s; g_stop = 1; }
@@ -50,66 +54,6 @@ typedef struct {
 } run_cfg_t;
 
 /* ---------------------------------------------------------------------------
- * 时间戳统计：Δtmst、实测 ODR、越窗比例（数据格式规范.md §4 要求解析器给出）
- * -------------------------------------------------------------------------*/
-typedef struct {
-    uint64_t n;                  /* 参与统计的记录数 */
-    int64_t  prev;               /* 上一条原始 tmst */
-    uint64_t sum;
-    int      dmin, dmax;
-    uint64_t hist[TMST_HIST_N];
-    uint64_t big;                /* Δ ≥ TMST_HIST_N 的次数（字节序配错时会爆这里） */
-    uint64_t out_of_window;      /* |Δ−125| > 1 µs 的次数 */
-} tmst_stat_t;
-
-static void tmst_stat_update(tmst_stat_t *ts, uint16_t tmst)
-{
-    if (ts->n == 0) {
-        ts->prev = tmst;
-        ts->n = 1;
-        return;
-    }
-    int d = (int)tmst - (int)ts->prev;
-    if (d < 0)
-        d += (int)VIB_TMST_WRAP;          /* 回绕展开（格式规范 §4） */
-    ts->prev = tmst;
-    ts->n++;
-    if (d < 0)
-        return;
-    ts->sum += (uint64_t)d;
-    if (d < ts->dmin) ts->dmin = d;
-    if (d > ts->dmax) ts->dmax = d;
-    if (d < (int)TMST_HIST_N)
-        ts->hist[d]++;
-    else
-        ts->big++;
-
-    const int lo = (int)VIB_TMST_NOMINAL_US - (int)VIB_TMST_TOL_US;
-    const int hi = (int)VIB_TMST_NOMINAL_US + (int)VIB_TMST_TOL_US;
-    if (d < lo || d > hi)
-        ts->out_of_window++;
-}
-
-static int tmst_stat_median(const tmst_stat_t *ts, int *median, double *measured_odr)
-{
-    uint64_t cnt = ts->n > 1 ? ts->n - 1 : 0;
-    if (cnt == 0)
-        return -1;
-    uint64_t acc = 0;
-    for (int i = 0; i < (int)TMST_HIST_N; i++) {
-        acc += ts->hist[i];
-        if (acc * 2 >= cnt) {
-            *median = i;
-            *measured_odr = (i > 0) ? 1e6 / (double)i : 0.0;
-            return 0;
-        }
-    }
-    *median = -1;                         /* 全部落在 big 桶 */
-    *measured_odr = 0.0;
-    return -1;
-}
-
-/* ---------------------------------------------------------------------------
  * 采集统计与单次排空
  * -------------------------------------------------------------------------*/
 typedef struct {
@@ -119,9 +63,10 @@ typedef struct {
     uint64_t samples;
     uint64_t clip_samples;
     uint32_t bad_records;
+    uint32_t spi_read_errors;      /* status/lost 读取失败次数（不得当作 0 健康） */
 } run_stat_t;
 
-static int drain_once(icm_t *icm, writer_t *w, run_stat_t *rs, tmst_stat_t *ts)
+static int drain_once(icm_t *icm, writer_t *w, run_stat_t *rs, tmst_accum_t *ts)
 {
     int recs = 0;
     if (icm_fifo_count_records(icm, &recs) != 0)
@@ -137,11 +82,14 @@ static int drain_once(icm_t *icm, writer_t *w, run_stat_t *rs, tmst_stat_t *ts)
         return -1;
     const uint64_t t_read = mono_ns();    /* 批量读完成时刻（仅作校验，非采样时刻） */
 
+    /* status/lost 读取失败必须显式标记，绝不能默认 0=健康 */
     uint8_t  st = 0;
     uint32_t lost = 0;
-    (void)icm_read_status(icm, &st);
-    (void)icm_read_lost(icm, &lost);
-    rs->device_lost_pkt = lost;
+    const int st_ok  = icm_read_status(icm, &st);
+    const int lost_ok = icm_read_lost(icm, &lost);
+    if (st_ok != 0 || lost_ok != 0)
+        rs->spi_read_errors++;
+    rs->device_lost_pkt = lost_ok == 0 ? lost : rs->device_lost_pkt;
 
     vib_record_t recs_out[VIB_SAMPLES_PER_BLOCK];
     uint32_t bad = 0;
@@ -161,7 +109,7 @@ static int drain_once(icm_t *icm, writer_t *w, run_stat_t *rs, tmst_stat_t *ts)
                 break;
             }
         }
-        tmst_stat_update(ts, recs_out[i].tmst_us);
+        tmst_accum_add(ts, recs_out[i].tmst_raw);
     }
     rs->clip_samples += clip;
     rs->samples += got;
@@ -172,10 +120,12 @@ static int drain_once(icm_t *icm, writer_t *w, run_stat_t *rs, tmst_stat_t *ts)
     bh.n_samples           = (uint16_t)got;
     bh.block_index         = rs->block_index++;
     bh.t_read_monotonic_ns = t_read;
-    bh.lost_pkt_total      = lost;
+    bh.lost_pkt_total      = lost_ok == 0 ? lost : 0;
     bh.clip_count          = clip;
-    if (st & ICM_STATUS_FIFO_FULL)
+    if (st_ok == 0 && (st & ICM_STATUS_FIFO_FULL))
         bh.flags |= VIB_BF_FIFO_FULL;
+    if (st_ok != 0 || lost_ok != 0)
+        bh.flags |= VIB_BF_SPI_ERR;        /* 本块 FIFO 健康未知 */
     if (recs < (int)(icm->cfg.wm_bytes / VIB_RECORD_SIZE))
         bh.flags |= VIB_BF_SHORT_READ;
 
@@ -309,7 +259,7 @@ int main(int argc, char **argv)
         strftime(rc.name, sizeof(rc.name), "vib_%y%m%dT%H%M%SZ", &tmv);
     }
 
-    fprintf(stderr, "=== 原始震动采集 v0.1.0（数据格式 v%d）===\n", VIB_FORMAT_VERSION);
+    fprintf(stderr, "=== 原始震动采集 v0.2.0（数据格式 v%d）===\n", VIB_FORMAT_VERSION);
     fprintf(stderr, "设备=%s  SPI=%u Hz  mode=%u  输出=%s/%s.bin\n",
             rc.dev, rc.spi_hz, rc.spi_mode, rc.outdir, rc.name);
 
@@ -325,7 +275,8 @@ int main(int argc, char **argv)
     memset(&icm, 0, sizeof(icm));
     icm.spi = &spi;
     icm_default_cfg(&icm.cfg);
-    icm.count_div = 16;                 /* 自检会实测确认 */
+    icm.count_div   = 1;                 /* cfg.intf_config0=0x60 → COUNT_REC=1（按记录）；自检回读确认 */
+    icm.count_endian = 1;                /* COUNT_ENDIAN=1（大端） */
 
     char selftest_report[2048];
     memset(selftest_report, 0, sizeof(selftest_report));
@@ -335,19 +286,18 @@ int main(int argc, char **argv)
         if (icm_selftest(&icm, selftest_report, sizeof(selftest_report)) != 0) {
             selftest_pass = 0;
             fprintf(stderr, "%s", selftest_report);
-            fprintf(stderr, "[main] 自检未通过；该批次必须标注为「未通过 G1」\n");
-            if (rc.selftest_only)
-                return 1;
-        } else {
-            fprintf(stderr, "%s", selftest_report);
+            fprintf(stderr, "[main] 自检未通过——默认中止采集（不带病采集；无硬件同步/校验宣称）\n");
+            spi_close(&spi);
+            return 1;
         }
+        fprintf(stderr, "%s", selftest_report);
     } else {
         snprintf(selftest_report, sizeof(selftest_report), "[自检] 已跳过（--no-selftest）\n");
         if (icm_soft_reset(&icm) != 0 || icm_apply_config(&icm) != 0) {
             fprintf(stderr, "[main] 配置写入失败\n");
+            spi_close(&spi);
             return 1;
         }
-        (void)icm_fifo_flush(&icm);
     }
 
     if (rc.selftest_only) {
@@ -356,13 +306,7 @@ int main(int argc, char **argv)
         return selftest_pass ? 0 : 1;
     }
 
-    if (icm_fifo_flush(&icm) != 0)
-        fprintf(stderr, "[main] 警告：FIFO 清空失败\n");
-    uint32_t lost0 = 0;
-    if (icm_read_lost(&icm, &lost0) == 0)
-        fprintf(stderr, "[main] FIFO_LOST_PKT 基线 = %u\n", lost0);
-
-    /* ---- 文件头 ---- */
+    /* ---- 文件头（先建好，供 writer 预分配与落盘）---- */
     vib_file_header_t fh;
     memset(&fh, 0, sizeof(fh));
     fh.t_start_monotonic_ns  = mono_ns();
@@ -375,8 +319,15 @@ int main(int argc, char **argv)
     fh.fs_gyro_dps           = icm.cfg.fs_gyro_dps;
     fh.sample_count_expected = rc.seconds > 0
         ? (uint64_t)(rc.seconds * (double)icm.cfg.odr_hz) : 0;
+    /* 时间戳换算元数据：raw ticks → µs = *32/30，内部时钟、RES=0 */
+    fh.tmst_scale_num = VIB_TMST_SCALE_NUM;
+    fh.tmst_scale_den = VIB_TMST_SCALE_DEN;
+    fh.tmst_source    = VIB_TMST_SOURCE_INTERNAL;
+    fh.tmst_res       = VIB_TMST_RES_1US;
+    fh.count_unit     = (uint8_t)icm.count_div;
+    fh.count_endian   = icm.count_endian;
 
-    /* ---- writer ---- */
+    /* ---- writer（预分配 + 起线程）---- */
     char binpath[768];
     snprintf(binpath, sizeof(binpath), "%s/%s.bin", rc.outdir, rc.name);
 
@@ -387,21 +338,39 @@ int main(int argc, char **argv)
         const uint64_t blocks  = samples / VIB_SAMPLES_PER_BLOCK + 2;
         prealloc = VIB_HEADER_SIZE + blocks * WRITER_SLOT_BYTES + VIB_BLOCK_HEADER_SIZE;
     }
-    if (writer_start(&wr, binpath, &fh, prealloc, rc.fsync_ms) != 0)
+    if (writer_start(&wr, binpath, &fh, prealloc, rc.fsync_ms) != 0) {
+        spi_close(&spi);
         return 1;
+    }
 
     /* ---- 实时化（放在 writer 起线程之后，避免把约束加到写盘线程）---- */
     if (rt_setup(rc.cpu, rc.prio, 1) != 0)
         fprintf(stderr, "[main] 实时化未完全成功——该批次有效性取决于"
-                        "FIFO_LOST_PKT 是否保持 0（见 时间戳与丢包验证.md）\n");
+                        "FIFO_LOST_PKT 是否保持基线不变\n");
+
+    /* ---- 有效采集起点：所有慢速准备（预分配/线程/RT）都完成之后，
+     * 才做「已验证清空 + 丢包基线」，随即立刻进入采集循环。
+     * 这样准备阶段的任何耗时都不会把 FIFO 灌满（旧顺序会在准备期间溢出）。---- */
+    if (icm_fifo_flush(&icm) != 0) {
+        fprintf(stderr, "[main] FIFO 清空失败——中止（不能以未知健康状态开始采集）\n");
+        writer_finish(&wr, 0);
+        spi_close(&spi);
+        return 1;
+    }
+    uint32_t lost0 = 0;
+    if (icm_read_lost(&icm, &lost0) != 0) {
+        fprintf(stderr, "[main] 读 FIFO_LOST_PKT 基线失败——中止\n");
+        writer_finish(&wr, 0);
+        spi_close(&spi);
+        return 1;
+    }
+    fprintf(stderr, "[main] FIFO 已清空，丢包基线 = %u（采集起点）\n", lost0);
 
     /* ---- 主循环 ---- */
     run_stat_t  rs;
-    tmst_stat_t ts;
+    tmst_accum_t ts;
     memset(&rs, 0, sizeof(rs));
-    memset(&ts, 0, sizeof(ts));
-    ts.dmin = 1 << 20;
-    ts.dmax = -(1 << 20);
+    tmst_accum_init(&ts);
 
     const uint64_t wm_records = icm.cfg.wm_bytes / VIB_RECORD_SIZE;
     const uint64_t t0 = mono_ns();
@@ -435,17 +404,15 @@ int main(int argc, char **argv)
             break;
 
         if (mono_ns() - last_print >= 5000000000ull) {
-            int median = -1;
-            double odr = 0.0;
-            (void)tmst_stat_median(&ts, &median, &odr);
+            const double odr = tmst_accum_rate_hz(&ts);
             fprintf(stderr,
                     "[main] %6.1f s | 样本 %llu | 块 %u | 丢块 %u | 器件丢包 %u | "
-                    "削顶 %llu | 实测ODR %.1f Hz | 越窗 %llu\n",
+                    "削顶 %llu | 实测ODR %.1f Hz | 越窗 %llu | SPI读错 %u\n",
                     (double)(mono_ns() - t0) / 1e9,
                     (unsigned long long)rs.samples, rs.block_index,
                     rs.host_dropped_blocks, rs.device_lost_pkt,
                     (unsigned long long)rs.clip_samples, odr,
-                    (unsigned long long)ts.out_of_window);
+                    (unsigned long long)ts.out_of_window, rs.spi_read_errors);
             last_print = mono_ns();
         }
     }
@@ -464,26 +431,26 @@ int main(int argc, char **argv)
     writer_finish(&wr, lost_final);
 
     /* ---- 统计输出 ---- */
-    int    median = -1;
-    double odr = 0.0;
-    (void)tmst_stat_median(&ts, &median, &odr);
-    const uint64_t total_records = ts.n > 0 ? ts.n - 1 : 0;
+    const int    median_raw = tmst_accum_median_raw(&ts);
+    const double odr        = tmst_accum_rate_hz(&ts);
+    const uint64_t total_deltas = ts.n_deltas;
     const double duration = (double)(mono_ns() - t0) / 1e9;
 
     fprintf(stderr, "\n=== 采集结束 ===\n");
     fprintf(stderr, "文件        : %s\n", binpath);
-    fprintf(stderr, "时长        : %.2f s\n", duration);
+    fprintf(stderr, "时长(主机)  : %.2f s\n", duration);
     fprintf(stderr, "记录数      : %llu（块 %u）\n",
             (unsigned long long)rs.samples, rs.block_index);
-    fprintf(stderr, "实测 ODR    : %.2f Hz（中位 Δtmst = %d µs，标称 %u Hz）\n",
-            odr, median, icm.cfg.odr_hz);
-    fprintf(stderr, "Δtmst 范围  : [%d, %d] µs；越窗 %llu / %llu\n",
-            ts.n > 1 ? ts.dmin : 0, ts.n > 1 ? ts.dmax : 0,
-            (unsigned long long)ts.out_of_window, (unsigned long long)total_records);
+    fprintf(stderr, "实测 ODR    : %.2f Hz（总 raw ticks/总时间；raw Δ 中位=%d，标称 %u Hz）\n",
+            odr, median_raw, icm.cfg.odr_hz);
+    fprintf(stderr, "raw Δ 范围  : [%d, %d]；越窗 %llu / %llu\n",
+            ts.n_deltas ? ts.dmin : 0, ts.n_deltas ? ts.dmax : 0,
+            (unsigned long long)ts.out_of_window, (unsigned long long)total_deltas);
     fprintf(stderr, "器件丢包    : %u（基线 %u）\n", lost_final, lost0);
     fprintf(stderr, "主机丢块    : %u\n", rs.host_dropped_blocks);
     fprintf(stderr, "削顶样本    : %llu\n", (unsigned long long)rs.clip_samples);
     fprintf(stderr, "包头异常    : %u\n", rs.bad_records);
+    fprintf(stderr, "SPI 读错    : %u（status/lost 读取失败，健康未知）\n", rs.spi_read_errors);
     fprintf(stderr, "写盘        : %llu B / %llu 块 / fsync %llu 次 / errno %d\n",
             (unsigned long long)wr.bytes_written, (unsigned long long)wr.blocks_written,
             (unsigned long long)wr.fsync_count, writer_error(&wr));
@@ -520,11 +487,12 @@ int main(int argc, char **argv)
             "    \"device_lost_pkt_final\": %u,\n"
             "    \"clip_samples\": %llu,\n"
             "    \"bad_fifo_headers\": %u,\n"
-            "    \"tmst_median_us\": %d,\n"
-            "    \"tmst_min_us\": %d,\n"
-            "    \"tmst_max_us\": %d,\n"
+            "    \"tmst_median_raw\": %d,\n"
+            "    \"tmst_raw_min\": %d,\n"
+            "    \"tmst_raw_max\": %d,\n"
             "    \"tmst_out_of_window\": %llu,\n"
             "    \"tmst_big_delta\": %llu,\n"
+            "    \"spi_read_errors\": %u,\n"
             "    \"writer_errno\": %d,\n"
             "    \"fsync_count\": %llu\n"
             "  }\n"
@@ -536,8 +504,9 @@ int main(int argc, char **argv)
             (unsigned long long)rs.samples, rs.block_index,
             rs.host_dropped_blocks, lost0, lost_final,
             (unsigned long long)rs.clip_samples, rs.bad_records,
-            median, ts.n > 1 ? ts.dmin : 0, ts.n > 1 ? ts.dmax : 0,
+            median_raw, ts.n_deltas ? ts.dmin : 0, ts.n_deltas ? ts.dmax : 0,
             (unsigned long long)ts.out_of_window, (unsigned long long)ts.big,
+            rs.spi_read_errors,
             writer_error(&wr), (unsigned long long)wr.fsync_count);
         fclose(f);
         fprintf(stderr, "运行日志    : %s\n", runlog);
@@ -553,6 +522,7 @@ int main(int argc, char **argv)
     spi_close(&spi);
 
     const int fatal = writer_error(&wr) != 0 || rs.host_dropped_blocks > 0 ||
-                      rs.device_lost_pkt > lost0 || rs.bad_records > 0;
+                      rs.device_lost_pkt > lost0 || rs.bad_records > 0 ||
+                      rs.spi_read_errors > 0;
     return fatal ? 2 : 0;
 }
