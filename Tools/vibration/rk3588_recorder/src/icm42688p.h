@@ -26,12 +26,19 @@
 #define ICM_REG_FIFO_COUNTH        0x2E  /* p.60 */
 #define ICM_REG_FIFO_COUNTL        0x2F  /* p.60 */
 #define ICM_REG_FIFO_DATA          0x30  /* p.60 */
-#define ICM_REG_SIGNAL_PATH_RESET  0x4B  /* p.61 bit2 FIFO_FLUSH */
+#define ICM_REG_SIGNAL_PATH_RESET  0x4B  /* p.61：bit3 ABORT_AND_RESET, bit2 TMST_STROBE, bit1 FIFO_FLUSH */
 #define ICM_REG_INTF_CONFIG0       0x4C  /* p.73 复位 0x30：bit7 HOLD_LAST bit6 COUNT_REC bit5 COUNT_ENDIAN bit4 DATA_ENDIAN */
 #define ICM_INTF0_HOLD_LAST        0x80  /* bit7 无效样本静默复制上一条（本实现清 0） */
 #define ICM_INTF0_COUNT_REC        0x40  /* bit6 1=FIFO_COUNT 按记录计数 */
 #define ICM_INTF0_COUNT_ENDIAN     0x20  /* bit5 1=FIFO_COUNT 大端（先 COUNTH 后 COUNTL） */
-#define ICM_INTF0_DATA_ENDIAN      0x10  /* bit4 0=传感器数据小端 */
+#define ICM_INTF0_DATA_ENDIAN      0x10  /* bit4 1=传感器数据大端（本实现用 0x70 → 置 1，消歧义） */
+
+/* SIGNAL_PATH_RESET（0x4B）位域：与官方 PX4 InvenSense_ICM42688P_registers.hpp
+ * SIGNAL_PATH_RESET_BIT 一致（ABORT_AND_RESET=Bit3, FIFO_FLUSH=Bit1）。
+ * 0x04 是 TMST_STROBE（Bit2），**不是** FIFO_FLUSH。 */
+#define ICM_SPR_FIFO_FLUSH         0x02  /* bit1：清 FIFO */
+#define ICM_SPR_TMST_STROBE        0x04  /* bit2：时间戳 strobe（不清 FIFO） */
+#define ICM_SPR_ABORT_AND_RESET    0x08  /* bit3：中止并复位 */
 #define ICM_REG_INTF_CONFIG1       0x4D  /* p.74 复位 0x91：bit2 RTC_MODE bit1:0 CLKSEL */
 #define ICM_REG_PWR_MGMT0          0x4E  /* p.75 复位 0x00：bit5 TEMP_DIS bit4 IDLE bit3:2 GYRO_MODE bit1:0 ACCEL_MODE */
 #define ICM_REG_GYRO_CONFIG0       0x4F  /* p.76 复位 0x06：[7:5] FS [3:0] ODR */
@@ -115,8 +122,10 @@ typedef struct {
     uint8_t  int_config0;
     /* INT_SOURCE0：bit2 使能 FIFO_THS→INT1（p.84） */
     uint8_t  int_source0;
-    /* INTF_CONFIG0（p.73）：0x60 = COUNT_REC=1(按记录) + COUNT_ENDIAN=1(大端)，
-     * 同时 DATA_ENDIAN=0(小端)、HOLD_LAST=0。写入后回读校验，不靠猜。 */
+    /* INTF_CONFIG0（p.73）：0x70 = COUNT_REC=1(按记录) + COUNT_ENDIAN=1(大端) +
+     * DATA_ENDIAN=1(传感器数据大端)，HOLD_LAST=0。轴上/时间戳统一按大端读，消除
+     * 「SENSOR_DATA_ENDIAN=0 时时间戳字节序」的歧义；存盘仍保持小端布局。
+     * 写入后回读校验，不靠猜。 */
     uint8_t  intf_config0;
 } icm_cfg_t;
 
@@ -161,7 +170,8 @@ int icm_read_fifo(icm_t *d, uint8_t *buf, size_t nbytes);
 
 /* 解析 FIFO 原始字节（Packet 3，16 B/条，手册 p.37–38）为记录数组。
  * 返回成功解析的记录数；*bad_headers 输出「包头与标称 Packet 3 不符」的条数（应恒为 0）。
- * 字节序：数据按 INTF_CONFIG0 的 SENSOR_DATA_ENDIAN=0（小端）解释，见 spi_dev.h 注释。 */
+ * 字节序：线缆上数据按 INTF_CONFIG0 的 SENSOR_DATA_ENDIAN=1（**大端**）解释，
+ * 解析后写入主机本机（小端）的 vib_record_t —— 存盘仍保持小端布局不变。 */
 size_t icm_parse_fifo(const uint8_t *raw, size_t nbytes, vib_record_t *out,
                       size_t out_cap, uint32_t *bad_headers);
 

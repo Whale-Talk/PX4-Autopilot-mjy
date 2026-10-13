@@ -47,10 +47,13 @@ typedef struct {
     uint32_t block_index;
     uint32_t host_dropped_blocks;
     uint32_t device_lost_pkt;
-    uint64_t samples;             /* 采集到的有效记录数（collected） */
+    uint64_t samples;             /* 采集到的记录数（collected，含 invalid） */
+    uint64_t invalid_samples;     /* 其中被标记 VIB_RF_INVALID（哨兵 -32768）的记录数 */
+    uint64_t first_batch_valid;   /* 首批（第一次排空）有效记录数，主机采样率分母要扣除 */
     uint64_t clip_samples;
     uint32_t bad_records;
-    uint32_t spi_read_errors;     /* status/lost 读取失败次数（不得当作 0 健康） */
+    uint32_t spi_read_errors;     /* status/lost/count 读取失败次数（不得当作 0 健康） */
+    int      runtime_fault;       /* 运行时 count/read_fifo/lost 失败：不能正常结束 */
     uint64_t first_read_ns;       /* 首次排空读完成时刻（0=未发生） */
     uint64_t last_read_ns;        /* 最近一次排空读完成时刻 */
     uint32_t drains;              /* 排空次数（测试钩子 max_drains 用） */
@@ -94,7 +97,10 @@ static int drain_once(icm_t *icm, writer_t *w, run_stat_t *rs, tmst_accum_t *ts)
     }
 
     uint32_t clip = 0;
+    uint32_t invalid_here = 0;
     for (size_t i = 0; i < got; i++) {
+        if (recs_out[i].rec_flags & VIB_RF_INVALID)
+            invalid_here++;
         const int16_t v[6] = { recs_out[i].accel[0], recs_out[i].accel[1], recs_out[i].accel[2],
                                recs_out[i].gyro[0],  recs_out[i].gyro[1],  recs_out[i].gyro[2] };
         for (int a = 0; a < 6; a++) {
@@ -106,7 +112,10 @@ static int drain_once(icm_t *icm, writer_t *w, run_stat_t *rs, tmst_accum_t *ts)
         tmst_accum_add(ts, recs_out[i].tmst_raw);
     }
     rs->clip_samples += clip;
+    rs->invalid_samples += invalid_here;
     rs->samples += got;
+    if (rs->drains == 1)                     /* 首批样本在 first_read_ns 之前生成，主机采样率要扣 */
+        rs->first_batch_valid = got - invalid_here;
 
     vib_block_header_t bh;
     memset(&bh, 0, sizeof(bh));
@@ -175,7 +184,7 @@ int vib_run(const vib_run_args_t *a)
     memset(&icm, 0, sizeof(icm));
     icm.spi = spi;
     icm_default_cfg(&icm.cfg);
-    icm.count_div   = 1;                 /* cfg.intf_config0=0x60 → COUNT_REC=1（按记录）；自检回读确认 */
+    icm.count_div   = 1;                 /* cfg.intf_config0=0x70 → COUNT_REC=1（按记录）；自检回读确认 */
     icm.count_endian = 1;                /* COUNT_ENDIAN=1（大端） */
 
     char selftest_report[2048];
@@ -291,16 +300,23 @@ int vib_run(const vib_run_args_t *a)
     while (!g_stop) {
         int recs = 0;
         if (icm_fifo_count_records(&icm, &recs) != 0) {
-            rs.spi_read_errors++;   /* 运行时 FIFO_COUNT 读失败：健康未知，不得静默重试 */
-            fprintf(stderr, "[run] FIFO_COUNT 读取失败，重试\n");
-            sleep_us(1000);
+            /* 运行时 FIFO_COUNT 读失败：FIFO 健康未知，不能静默重试后「正常结束」。
+             * 记录并中止采集，最终以 writer_abort 截断（无结束块），解析器拒绝该文件。 */
+            rs.spi_read_errors++;
+            rs.runtime_fault = 1;
+            fprintf(stderr, "[run] FIFO_COUNT 读取失败——中止采集（健康未知，不静默重试）\n");
+            break;
         } else {
             const uint64_t now = mono_ns();
             const int need = (recs > 0) &&
                              ((uint64_t)recs >= wm_records || (now - last_drain) > 3000000ull);
             if (need) {
-                if (drain_once(&icm, &wr, &rs, &ts) < 0)
-                    fprintf(stderr, "[run] 排空失败\n");
+                if (drain_once(&icm, &wr, &rs, &ts) < 0) {
+                    rs.spi_read_errors++;
+                    rs.runtime_fault = 1;
+                    fprintf(stderr, "[run] 排空（FIFO 读）失败——中止采集（健康未知）\n");
+                    break;
+                }
                 last_drain = mono_ns();
             } else {
                 sleep_us(250);
@@ -327,28 +343,50 @@ int vib_run(const vib_run_args_t *a)
         }
     }
 
-    /* ---- 收尾：把 FIFO 剩余数据排空 ---- */
-    for (int i = 0; i < 64; i++) {
-        int recs = 0;
-        if (icm_fifo_count_records(&icm, &recs) != 0 || recs <= 0)
-            break;
-        if (drain_once(&icm, &wr, &rs, &ts) < 0)
-            break;
+    /* ---- 收尾：把 FIFO 剩余数据排空（运行时已发生故障则不再排空） ---- */
+    if (!rs.runtime_fault) {
+        for (int i = 0; i < 64; i++) {
+            int recs = 0;
+            if (icm_fifo_count_records(&icm, &recs) != 0 || recs <= 0)
+                break;
+            if (drain_once(&icm, &wr, &rs, &ts) < 0) {
+                rs.spi_read_errors++;
+                rs.runtime_fault = 1;
+                break;
+            }
+        }
     }
 
     /* 主机采样率：按「排空读时刻」定义的采集窗口，不含 writer 关闭耗时；
+     * 分母用**有效记录**（collected − invalid），并扣除首批（首读前已生成）样本——
+     * 首批样本在 first_read_ns 之前生成，不能算进窗口内。
      * 边界不确定度 = FIFO 满窗（读时刻非采样时刻，块内样本可早至 16 ms 前）。 */
     const uint64_t host_window_ns = (rs.last_read_ns > rs.first_read_ns)
         ? (rs.last_read_ns - rs.first_read_ns) : 0;
+    const uint64_t valid_total = rs.samples > rs.invalid_samples
+        ? (rs.samples - rs.invalid_samples) : 0;
+    const uint64_t valid_in_window = valid_total > rs.first_batch_valid
+        ? (valid_total - rs.first_batch_valid) : 0;
     const double host_rate_hz = host_window_ns
-        ? (double)rs.samples * 1e9 / (double)host_window_ns : 0.0;
+        ? (double)valid_in_window * 1e9 / (double)host_window_ns : 0.0;
 
     uint32_t lost_final = rs.device_lost_pkt;
-    (void)icm_read_lost(&icm, &lost_final);
-    writer_finish(&wr, lost_final);
+    if (icm_read_lost(&icm, &lost_final) != 0) {
+        /* 最后读 FIFO_LOST_PKT 失败：不能以旧丢包总数写正常结束块。 */
+        rs.spi_read_errors++;
+        rs.runtime_fault = 1;
+        fprintf(stderr, "[run] 最后读 FIFO_LOST_PKT 失败——中止（不写正常结束块）\n");
+    }
+    /* Tail drops have no later block index to expose the loss. Omit END even
+     * when earlier blocks were written correctly, so file-only checks fail. */
+    if (rs.runtime_fault || rs.host_dropped_blocks > 0 || writer_error(&wr) != 0)
+        writer_abort(&wr);          /* 无结束块：解析器据此拒绝「非正常结束」的文件 */
+    else
+        writer_finish(&wr, lost_final);
 
-    /* 采集到的有效记录（collected）与已写入（written）区分：差值 ≈ 环满丢块 */
+    /* 采集到的记录（collected，含 invalid）与已写入（written）区分：差值 ≈ 环满丢块 */
     const uint64_t collected = rs.samples;
+    const uint64_t invalid   = rs.invalid_samples;
     const uint64_t written   = wr.samples_written;
     const uint64_t unwritten = (collected > written) ? (collected - written) : 0;
 
@@ -362,18 +400,19 @@ int vib_run(const vib_run_args_t *a)
     fprintf(stderr, "文件        : %s\n", binpath);
     fprintf(stderr, "采集窗口(主机): %.6f s（排空读时刻区间，不含 writer 关闭）\n",
             (double)host_window_ns / 1e9);
-    fprintf(stderr, "记录数      : %llu 采集 / %llu 写入 / %llu 未写入（块 %u）\n",
-            (unsigned long long)collected, (unsigned long long)written,
+    fprintf(stderr, "记录数      : %llu 采集 / %llu 有效 / %llu 无效（哨兵） / %llu 写入 / %llu 未写入（块 %u）\n",
+            (unsigned long long)collected, (unsigned long long)(valid_total),
+            (unsigned long long)invalid, (unsigned long long)written,
             (unsigned long long)unwritten, rs.block_index);
     fprintf(stderr, "实测 ODR    : %.2f Hz（总 raw ticks/总时间；raw Δ 中位=%d，标称 %u Hz）\n",
             odr, median_raw, icm.cfg.odr_hz);
     fprintf(stderr, "主机采样率  : %.2f Hz（采集窗口 %llu ns；边界不确定度 ±%u µs = FIFO 满窗）\n",
             host_rate_hz, (unsigned long long)host_window_ns, VIB_FIFO_FULL_WINDOW_US);
-    fprintf(stderr, "raw Δ 范围  : [%d, %d]；越窗 %llu/%llu；重复 %llu；大间隔 %llu；断裂 %llu；%s\n",
+    fprintf(stderr, "raw Δ 范围  : [%d, %d]；越窗 %llu/%llu；重复 %llu；大间隔 %llu；缺口 %llu；断裂 %llu；%s\n",
             ts.n_deltas ? ts.dmin : 0, ts.n_deltas ? ts.dmax : 0,
             (unsigned long long)ts.out_of_window, (unsigned long long)total_deltas,
             (unsigned long long)ts.dup, (unsigned long long)ts.big,
-            (unsigned long long)ts.breaks,
+            (unsigned long long)ts.gap, (unsigned long long)ts.breaks,
             untrusted ? "时间轴不可信" : "时间轴连续");
     fprintf(stderr, "器件丢包    : %u（基线 %u）\n", lost_final, lost0);
     fprintf(stderr, "主机丢块    : %u\n", rs.host_dropped_blocks);
@@ -412,6 +451,9 @@ int vib_run(const vib_run_args_t *a)
             "  \"selftest_report\": \"%s\",\n"
             "  \"stats\": {\n"
             "    \"records_collected\": %llu,\n"
+            "    \"records_valid\": %llu,\n"
+            "    \"records_invalid\": %llu,\n"
+            "    \"records_first_batch_valid\": %llu,\n"
             "    \"records_written\": %llu,\n"
             "    \"records_unwritten\": %llu,\n"
             "    \"blocks\": %u,\n"
@@ -425,9 +467,11 @@ int vib_run(const vib_run_args_t *a)
             "    \"tmst_raw_max\": %d,\n"
             "    \"tmst_out_of_window\": %llu,\n"
             "    \"tmst_big_delta\": %llu,\n"
+            "    \"tmst_gap\": %llu,\n"
             "    \"tmst_dup_timestamp\": %llu,\n"
             "    \"tmst_breaks\": %llu,\n"
             "    \"tmst_untrusted\": %d,\n"
+            "    \"runtime_fault\": %d,\n"
             "    \"spi_read_errors\": %u,\n"
             "    \"writer_errno\": %d,\n"
             "    \"fsync_count\": %llu\n"
@@ -439,14 +483,17 @@ int vib_run(const vib_run_args_t *a)
             icm.cfg.odr_hz, odr, icm.cfg.wm_bytes, icm.reg_hash,
             icm.who_am_i, a->frame,
             selftest_pass ? "true" : "false", esc,
-            (unsigned long long)collected, (unsigned long long)written,
-            (unsigned long long)unwritten, rs.block_index,
+            (unsigned long long)collected, (unsigned long long)valid_total,
+            (unsigned long long)invalid, (unsigned long long)rs.first_batch_valid,
+            (unsigned long long)written, (unsigned long long)unwritten, rs.block_index,
             rs.host_dropped_blocks, lost0, lost_final,
             (unsigned long long)rs.clip_samples, rs.bad_records,
             median_raw, ts.n_deltas ? ts.dmin : 0, ts.n_deltas ? ts.dmax : 0,
             (unsigned long long)ts.out_of_window, (unsigned long long)ts.big,
-            (unsigned long long)ts.dup, (unsigned long long)ts.breaks,
+            (unsigned long long)ts.gap, (unsigned long long)ts.dup,
+            (unsigned long long)ts.breaks,
             untrusted ? 1 : 0,
+            rs.runtime_fault ? 1 : 0,
             rs.spi_read_errors,
             writer_error(&wr), (unsigned long long)wr.fsync_count);
         fclose(f);
@@ -465,6 +512,7 @@ int vib_run(const vib_run_args_t *a)
 
     const int fatal = writer_error(&wr) != 0 || rs.host_dropped_blocks > 0 ||
                       rs.device_lost_pkt > lost0 || rs.bad_records > 0 ||
-                      rs.spi_read_errors > 0 || untrusted || collected == 0;
+                      rs.spi_read_errors > 0 || rs.runtime_fault ||
+                      untrusted || collected == 0;
     return fatal ? 2 : 0;
 }

@@ -3,11 +3,14 @@
 """
 sync_test.py — 外置 .bin ↔ X7 native FIFO ULog 时间映射工具的测试
 
-覆盖（fix 2 的测试需求）：
+覆盖：
   拟合判据：无事件 / 单/双事件 / missing provenance / nan·invalid / range 外 /
-            leverage 离群 / 不合理时钟比 / 高不确定度不宣称 500Hz
+            leverage 离群 / 不合理时钟比 / 高不确定度不宣称 500Hz /
+            事件跨外置断裂段被拒
   X7 分段：device=0 拒绝、dt/scale/samples 无效拒绝、回退/重复/缺包真正断段、padding 忽略
-  CLI smoke：真实 .bin + native ULog + 真实格式 events JSON，校验映射后的逐样本时刻/单位
+  CLI smoke：真实 .bin + native ULog + 真实格式 events JSON，校验：
+            映射后的逐样本时刻/单位、--csv-mapped 的 t_px4_us（已知 offset/drift）、
+            native reader 是 diagnostic（非 0 退出，不伪装 pyulog 级验收）
 只依赖标准库 + 本仓库模块，无硬件。
 """
 
@@ -44,11 +47,14 @@ def check(cond, label, extra=""):
 # 小工具
 # ---------------------------------------------------------------------------
 def seg(device_id, first_us, last_us):
-    """构造最小 X7 连续段（供 fit_events 单元测试）。"""
-    return {"device_id": device_id,
-            "packets": [{"packet_index": 0, "anchor_us": last_us, "n": 1,
-                         "dt_us": 125.0, "first_us": first_us, "last_us": last_us,
-                         "scale": 0.001}]}
+    """构造单个 X7 连续段跨度（fit_events 用，packets 是计数）。"""
+    return {"device_id": device_id, "first_us": first_us, "last_us": last_us,
+            "packets": 1, "samples": 1}
+
+
+def ext_seg(first_us, last_us):
+    """构造外置连续段（fit_events 用）。"""
+    return {"segment_id": 0, "first_us": first_us, "last_us": last_us, "samples": 1}
 
 
 def ev(ext, x7, label="e", provenance="tap", uncertainty_us=100.0):
@@ -61,7 +67,7 @@ def write_vib3(path, seconds):
     nrec = seconds * 8000
     header = struct.pack(
         br.FILE_HDR_FMT,
-        b"VIB2", 3, 256, 0, 0x000200, 0xDEADBEEF, 8000, 16, 2000, 16, 0,
+        b"VIB2", 3, 256, 0, 0x000201, 0xDEADBEEF, 8000, 16, 2000, 16, 0,
         123456789, 1750000000000000000, 0x47, 0, b"\x00" * 6, nrec,
         32, 30, 0, 0, 1, 1, 0, b"\x00" * 176, 0)
     crc = zlib.crc32(header[:252]) & 0xFFFFFFFF
@@ -117,24 +123,27 @@ def test_fit_recovers_offset_and_drift():
     a = 1.0 + drift_ppm / 1e6
     ext = [i * 1_000_000.0 for i in range(5)]
     events = [ev(x, a * x + big_offset, "e%d" % i) for i, x in enumerate(ext)]
-    fit = sync.fit_events(events, 0.0, 6_000_000.0,
-                          [seg(0x36001A, 5_000_000.0, 12_000_000.0)], 0x36001A)
+    fit = sync.fit_events(events, [ext_seg(0.0, 6_000_000.0)],
+                          seg(0x36001A, 5_000_000.0, 12_000_000.0), 0x36001A,
+                          phase_budget_us=1000.0)
     check(fit["status"] == "ok", "状态 ok（实际 %s）" % fit["status"], str(fit["notes"]))
     check(abs(fit["drift_ppm"] - drift_ppm) < 1.0, "drift 恢复 ≈ %.0f ppm" % drift_ppm,
           str(fit["drift_ppm"]))
     check(abs(fit["intercept_us"] - big_offset) < 1.0, "intercept 恢复 ≈ %.0f µs" % big_offset,
           str(fit["intercept_us"]))
     check(fit["residual_rms_us"] < 1e-3, "无噪声残差 RMS ≈ 0")
-    check(fit["usable_for_500hz"], "低不确定度 + 零残差 → 可用于 500 Hz")
+    check(fit["event_alignment_within_budget"], "事件拟合符合给定容许误差")
+    check(not fit["usable_for_500hz"], "用户容许误差不等于实机样本相位校准证据")
+    check(fit["phase_suitability"] == "unverified", "实机样本相位仍为 unverified")
 
 
 def test_fit_insufficient_events():
     print("== 无事件 / 单/双事件 → 缺证据 ==\n")
-    f0 = sync.fit_events([], 0, 1000, [seg(1, 0, 1000)], 1)
+    f0 = sync.fit_events([], [ext_seg(0, 1000)], seg(1, 0, 1000), 1)
     check(f0["status"] == "insufficient_events", "0 事件 → insufficient_events")
-    f1 = sync.fit_events([ev(1, 1)], 0, 1000, [seg(1, 0, 1000)], 1)
+    f1 = sync.fit_events([ev(1, 1)], [ext_seg(0, 1000)], seg(1, 0, 1000), 1)
     check(f1["status"] == "insufficient_events", "1 事件 → insufficient_events")
-    f2 = sync.fit_events([ev(1, 1), ev(2, 2)], 0, 1000, [seg(1, 0, 1000)], 1)
+    f2 = sync.fit_events([ev(1, 1), ev(2, 2)], [ext_seg(0, 1000)], seg(1, 0, 1000), 1)
     check(f2["status"] == "insufficient_events", "2 事件 → insufficient_events")
 
 
@@ -160,16 +169,26 @@ def test_validate_missing_provenance_nan():
 def test_fit_out_of_range():
     print("== 事件落在段/文件之外 → out_of_range ==\n")
     events = [ev(500.0, 5_000_500.0, "e%d" % i) for i in range(4)]
-    # external 超出 [0, 400]（第 4 个事件 external=1500 > 400）
     events[-1] = ev(1500.0, 5_001_500.0, "e3")
-    fit = sync.fit_events(events, 0.0, 400.0, [seg(1, 5_000_000, 6_000_000)], 1)
+    fit = sync.fit_events(events, [ext_seg(0.0, 400.0)], seg(1, 5_000_000, 6_000_000), 1)
     check(fit["status"] == "out_of_range", "external 超界 → out_of_range（实际 %s）"
           % fit["status"])
     # x7 超出段
     events2 = [ev(100.0, 7_000_000.0, "e%d" % i) for i in range(4)]
-    fit2 = sync.fit_events(events2, 0.0, 1000.0, [seg(1, 5_000_000, 6_000_000)], 1)
+    fit2 = sync.fit_events(events2, [ext_seg(0.0, 1000.0)], seg(1, 5_000_000, 6_000_000), 1)
     check(fit2["status"] == "out_of_range", "x7 超段 → out_of_range（实际 %s）"
           % fit2["status"])
+
+
+def test_fit_events_span_external_segments():
+    print("== 事件跨外置断裂段 → 拒绝（不跨断裂拼轴）==\n")
+    # 两个外置连续段 [0,1000] 与 [2000,3000]（中间断裂）；事件落在两段 → 拒绝
+    segments = [ext_seg(0.0, 1000.0), {"segment_id": 1, "first_us": 2000.0,
+                                       "last_us": 3000.0, "samples": 1}]
+    events = [ev(500.0, 5_000_500.0, "e%d" % i) for i in range(3)]
+    events.append(ev(2500.0, 5_002_500.0, "e3"))   # 落在第二段
+    fit = sync.fit_events(events, segments, seg(1, 5_000_000, 6_000_000), 1)
+    check(fit["status"] == "out_of_range", "跨外置断裂段 → 拒绝（实际 %s）" % fit["status"])
 
 
 def test_fit_leverage_outlier():
@@ -179,12 +198,11 @@ def test_fit_leverage_outlier():
     base = 8_000_000.0
     ext = [1_000_000.0 * i for i in range(5)]
     x7 = [a * x + base for x in ext]
-    # 追加一个杠杆离群：external 很远但 x7 错（不在直线上）
     ext.append(50_000_000.0)
     x7.append(8_100_000.0)
     events = [ev(x, y, "e%d" % i) for i, (x, y) in enumerate(zip(ext, x7))]
-    fit = sync.fit_events(events, 0.0, 60_000_000.0,
-                          [seg(1, 7_000_000.0, 20_000_000.0)], 1)
+    fit = sync.fit_events(events, [ext_seg(0.0, 60_000_000.0)],
+                          seg(1, 7_000_000.0, 20_000_000.0), 1)
     check(fit["status"] == "ok", "稳健拟合后仍 ok（实际 %s）" % fit["status"], str(fit["notes"]))
     check("e5" in fit["outlier_labels"], "杠杆离群 e5 被剔除（实际 %s）" % fit["outlier_labels"])
     check(abs(fit["drift_ppm"] - drift_ppm) < 2.0, "refit 后 drift 恢复 ≈ %.0f ppm" % drift_ppm,
@@ -195,24 +213,33 @@ def test_fit_unreasonable_clock_ratio():
     print("== 不合理时钟比 → 拒绝 ==\n")
     events = [ev(i * 1_000_000.0, 1.5 * i * 1_000_000.0 + 5_000_000, "e%d" % i)
               for i in range(5)]
-    fit = sync.fit_events(events, 0.0, 10_000_000.0,
-                          [seg(1, 5_000_000.0, 30_000_000.0)], 1, max_drift_ppm=1000.0)
+    fit = sync.fit_events(events, [ext_seg(0.0, 10_000_000.0)],
+                          seg(1, 5_000_000.0, 30_000_000.0), 1, max_drift_ppm=1000.0)
     check(fit["status"] == "unreasonable_clock_ratio",
           "50%% drift → unreasonable_clock_ratio（实际 %s）" % fit["status"])
 
 
 def test_fit_high_uncertainty_not_500hz():
-    print("== 高不确定度即使零残差也不宣称 500Hz ==\n")
+    print("== 高不确定度即使零残差也不宣称 500Hz（默认 unverified）==\n")
     a = 1.0 + 10.0 / 1e6
     base = 5_000_000.0
     events = [ev(i * 1_000_000.0, a * i * 1_000_000.0 + base, "e%d" % i,
                  uncertainty_us=5000.0) for i in range(5)]
-    fit = sync.fit_events(events, 0.0, 10_000_000.0,
-                          [seg(1, 5_000_000.0, 15_000_000.0)], 1)
+    fit = sync.fit_events(events, [ext_seg(0.0, 10_000_000.0)],
+                          seg(1, 5_000_000.0, 15_000_000.0), 1)
     check(fit["status"] == "ok", "残差零 → ok")
     check(fit["residual_rms_us"] < 1e-3, "零残差")
-    check(not fit["usable_for_500hz"],
-          "不确定度 5000 µs > 200 µs → 不宣称 500Hz（usable=%s）" % fit["usable_for_500hz"])
+    check(not fit["usable_for_500hz"], "默认（无相位预算）不宣称 500Hz（usable=%s）"
+          % fit["usable_for_500hz"])
+    check(fit["phase_suitability"] == "unverified", "phase_suitability=unverified")
+    check(fit["worst_inlier_uncertainty_us"] == 5000.0, "worst inlier 不确定度=5000（不用 median）")
+
+    # 显式预算 100 µs，但 worst=5000 > 100 → exceeds_budget
+    fit2 = sync.fit_events(events, [ext_seg(0.0, 10_000_000.0)],
+                           seg(1, 5_000_000.0, 15_000_000.0), 1, phase_budget_us=100.0)
+    check(not fit2["usable_for_500hz"], "显式预算 100 µs 但 worst=5000 → 不宣称")
+    check(fit2["event_alignment_within_budget"] is False, "事件拟合不确定度超过容许误差")
+    check(fit2["phase_suitability"] == "unverified", "实机样本相位仍为 unverified")
 
 
 # ---------------------------------------------------------------------------
@@ -238,29 +265,23 @@ def test_reconstruct_device0_and_invalid():
     check(stats["invalid_dt"] == 1, "dt=0 计 1 个")
     check(stats["invalid_scale"] == 1, "scale=0 计 1 个")
     check(stats["invalid_samples"] == 1, "samples=100 计 1 个")
-    # 有效包：第 1 和第 6 个（anchor 1000 与 6000），其余被拒
     total_valid = sum(len(s["packets"]) for s in segments)
     check(total_valid == 2, "有效包 2 个（实际 %d）" % total_valid)
 
 
 def test_reconstruct_breaks():
     print("== 回退/重复/缺包真正断段 ==\n")
-    # 每包 20 样本 * 125 µs = 2500 µs 覆盖；连续锚点应相差 2500
     rows = [
         {"timestamp": 1000, "anchor": 100000, "device_id": 0x36001A, "dt": 125.0,
          "samples": 20},
         {"timestamp": 2000, "anchor": 102500, "device_id": 0x36001A, "dt": 125.0,
          "samples": 20},
-        # 缺包：跳变 20000 µs >> 2500+2000
         {"timestamp": 3000, "anchor": 122500, "device_id": 0x36001A, "dt": 125.0,
          "samples": 20},
-        # 回退
         {"timestamp": 4000, "anchor": 120000, "device_id": 0x36001A, "dt": 125.0,
          "samples": 20},
-        # 重复（相同 anchor+timestamp）
         {"timestamp": 4000, "anchor": 120000, "device_id": 0x36001A, "dt": 125.0,
          "samples": 20},
-        # 新 device → 新段
         {"timestamp": 5000, "anchor": 200000, "device_id": 0x99001A, "dt": 125.0,
          "samples": 20},
     ]
@@ -272,15 +293,14 @@ def test_reconstruct_breaks():
 
 def test_reconstruct_padding_ignored():
     print("== padding 忽略（只取 samples 有效前缀）==\n")
-    # samples=5，x 数组 32 个值，后 27 个是 padding（非 0），应被忽略
     x = list(range(5)) + [999] * 27
     rows = [{"timestamp": 1000, "anchor": 1000, "device_id": 0x36001A, "dt": 125.0,
              "samples": 5, "x": x, "y": [0] * 32, "z": [0] * 32}]
-    segments, _ = sync.reconstruct_x7_segments(fifo_dataset(rows))
+    ds = fifo_dataset(rows)
+    segments, _ = sync.reconstruct_x7_segments(ds)
     check(len(segments) == 1 and segments[0]["packets"][0]["n"] == 5,
           "每包只取有效前缀 n=5（实际 %s）" % [s["packets"][0]["n"] for s in segments])
-    # 逐样本迭代：只产出 5 个样本，值 = x[i]*scale（padding 999 不出现）
-    got = list(sync.x7_sample_iter(fifo_dataset(rows), segments, 0x36001A, "gyro"))
+    got = list(sync.x7_sample_iter(ds, segments[0], "gyro"))
     check(len(got) == 5, "逐样本只产出 5 个（实际 %d）" % len(got))
     check(all(v[2] != 999 * 0.001 for v in got), "padding 值（999*scale）未泄漏进样本")
 
@@ -314,21 +334,20 @@ def write_native_ulog(path, rows, topic="sensor_gyro_fifo"):
 
 
 def test_cli_smoke(tmpdir):
-    print("== CLI smoke：真实 bin + native ULog + events，校验映射时刻/单位 ==\n")
+    print("== CLI smoke：真实 bin + native ULog + events，校验映射时刻/单位/diagnostic ==\n")
     devid = 0x36001A
-    # 外置 bin：2 s（首样本 0 相对）
     binpath = write_vib3(os.path.join(tmpdir, "ext.bin"), 2)
-    # X7 native ULog：500 包，dt=125 µs，samples=32，锚点从 10,000,000 起（覆盖 2 s）
+    # X7 native ULog：500 包，dt=125 µs，samples=32，锚点从 10,000,000 起
     rows = []
     for k in range(500):
         anchor = 10_000_000 + k * 32 * 125
-        ts = anchor + 2500                      # 发布时刻略晚于锚点
+        ts = anchor + 2500
         x = [i for i in range(32)]
         y = [i + 1 for i in range(32)]
         z = [i + 2 for i in range(32)]
         rows.append((ts, anchor, devid, 125.0, 0.001, 32, x, y, z))
     ulogpath = write_native_ulog(os.path.join(tmpdir, "x7.ulg"), rows)
-    # 事件：drift 100 ppm，offset 10,000,000 µs，都在两段时间轴内
+    # 事件：drift 100 ppm，offset 10,000,000 µs
     a = 1.0 + 100.0 / 1e6
     events = {"events": [
         {"external_us": 100000.0, "x7_us": a * 100000.0 + 10_000_000.0,
@@ -346,23 +365,27 @@ def test_cli_smoke(tmpdir):
 
     csv_ext = os.path.join(tmpdir, "ext.csv")
     csv_x7 = os.path.join(tmpdir, "x7.csv")
+    csv_mapped = os.path.join(tmpdir, "mapped.csv")
     json_out = os.path.join(tmpdir, "out.json")
 
     rc = sync.main([
         "--bin", binpath, "--ulog", ulogpath, "--events", eventspath,
         "--axis", "gyro", "--reader", "native", "--device", str(devid),
-        "--csv-ext", csv_ext, "--csv-x7", csv_x7, "--json", json_out,
+        "--csv-ext", csv_ext, "--csv-x7", csv_x7, "--csv-mapped", csv_mapped,
+        "--json", json_out,
     ])
-    check(rc == 0, "CLI 退出码 0（实际 %d）" % rc)
+    # native reader 是 diagnostic fallback：即使 fit ok 也非 0 退出（不伪装 pyulog 级验收）
+    check(rc == 2, "native reader → 退出码 2（diagnostic，不伪装验收；实际 %d）" % rc)
 
     with open(json_out, "r", encoding="utf-8") as f:
         payload = json.load(f)
     check(payload["mapping"]["status"] == "ok", "mapping.status ok（实际 %s）"
           % payload["mapping"]["status"])
+    check(payload["ulog"]["reader_grade"] == "diagnostic", "reader_grade=diagnostic")
     check(abs(payload["mapping"]["drift_ppm"] - 100.0) < 2.0,
           "drift ≈ 100 ppm（实际 %.3f）" % payload["mapping"]["drift_ppm"])
 
-    # 校验外置 CSV：header 含 segment/t_us；首样本 t_us=0；单位 g/dps 列名
+    # 外置 CSV：header 含 segment/t_us；首样本 t_us=0
     with open(csv_ext, "r", encoding="utf-8") as f:
         header = f.readline().strip().split(",")
         first = f.readline().strip().split(",")
@@ -371,11 +394,11 @@ def test_cli_smoke(tmpdir):
     check(first[1] == "0" and abs(float(first[2])) < 1e-6,
           "外置首样本 t_us=0（实际 %s）" % first[2])
 
-    # 校验 X7 CSV：header 单位 + 首样本时刻 = anchor - (N-1)*dt + 值 = raw*scale
+    # X7 CSV：header 单位 + 首样本时刻 = anchor - (N-1)*dt + 值 = raw*scale
     with open(csv_x7, "r", encoding="utf-8") as f:
         header = f.readline().strip().split(",")
         row0 = f.readline().strip().split(",")
-    check("t_us" in header and "x_rad_s" in header, "X7 CSV 头含 t_us 与 x_rad_s（rad/s 单位）",
+    check("t_us" in header and "x_rad_s" in header, "X7 CSV 头含 t_us 与 x_rad_s（rad/s）",
           str(header))
     exp_first_t = 10_000_000 - 31 * 125.0
     check(abs(float(row0[2]) - exp_first_t) < 1e-6,
@@ -384,12 +407,31 @@ def test_cli_smoke(tmpdir):
           % row0[4])
     check(int(row0[3]) == devid, "X7 CSV device_id == 选定 device（实际 %s）" % row0[3])
 
+    # 映射 CSV：header 含 t_px4_us；首样本 t_px4 ≈ intercept（10,000,000）
+    with open(csv_mapped, "r", encoding="utf-8") as f:
+        header = f.readline().strip().split(",")
+        row0 = f.readline().strip().split(",")   # index 0
+        f.readline()                              # index 1
+        row2 = f.readline().strip().split(",")   # index 2
+    check("t_px4_us" in header, "映射 CSV 头含 t_px4_us（实际 %s）" % header[:4])
+    inter = payload["mapping"]["intercept_us"]
+    slope = payload["mapping"]["slope"]
+    check(abs(float(row0[3]) - inter) < 1.0,
+          "映射首样本 t_px4 ≈ intercept %.0f（实际 %s）" % (inter, row0[3]))
+    # index=2 的外置 t_us ≈ 2*125=250 µs；t_px4 ≈ slope*250 + intercept
+    t_ext2 = float(row2[2])
+    exp_px4 = slope * t_ext2 + inter
+    check(abs(float(row2[3]) - exp_px4) < 1e-6,
+          "映射逐样本 t_px4 = slope*t_ext + intercept（实际 %.3f vs %.3f）"
+          % (float(row2[3]), exp_px4))
+
 
 def main():
     test_fit_recovers_offset_and_drift()
     test_fit_insufficient_events()
     test_validate_missing_provenance_nan()
     test_fit_out_of_range()
+    test_fit_events_span_external_segments()
     test_fit_leverage_outlier()
     test_fit_unreasonable_clock_ratio()
     test_fit_high_uncertainty_not_500hz()

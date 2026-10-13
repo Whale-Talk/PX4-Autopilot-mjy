@@ -89,11 +89,39 @@ echo "--- 10) 生产启动顺序确定性 mock（实际执行 run.c 的 vib_run�
 gcc -O2 -Wall -Wextra -Wshadow -Wconversion -Werror -std=gnu11 -I"$SRC" \
     -o "$OUT/startup_test" "$SRC/tests/startup_test.c" "$SRC/util.c" \
     "$SRC/spi_dev.c" "$SRC/icm42688p.c" "$SRC/writer.c" "$SRC/tmst.c" "$SRC/run.c" \
-    -lpthread -lrt
+    -Wl,--wrap=writer_submit -lpthread -lrt
 "$OUT/startup_test"
 
 echo "--- 11) 外置 bin ↔ X7 native FIFO 时间映射（offset+drift+残差）---"
 PYTHONPATH="$ROOT/tools:$VIBDIR" python3 "$TESTS/sync_test.py"
+
+echo "--- 12) 生产 writer 落盘 I/O 故障注入（链接期 --wrap）：首先成功写 data，再制造失败 ---"
+gcc -O2 -Wall -Wextra -Wshadow -Wconversion -Werror -std=gnu11 -I"$SRC" \
+    -Wl,--wrap=write -Wl,--wrap=fdatasync -Wl,--wrap=close \
+    -o "$OUT/writer_fault" "$SRC/tests/writer_fault_test.c" "$SRC/writer.c" \
+    "$SRC/util.c" -lpthread -lrt
+echo "  编译通过（-Werror + --wrap）"
+"$OUT/writer_fault" "$OUT/wfault"
+python3 - "$ROOT/tools" "$OUT/wfault/must_reject" <<'PY'
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import bin_reader as br
+d = sys.argv[2]
+files = sorted(f for f in os.listdir(d) if f.endswith(".bin"))
+assert files, "故障注入没有产物"
+bad = [n for n in files
+       if br.BinReader(os.path.join(d, n)).run()["ok"]]
+print("  结构必坏产物 %d 个，解析器全部判为不 OK ✓" % len(files))
+if bad:
+    print("  ✗ 被误判为健康：%s" % bad)
+    sys.exit(1)
+PY
+
+echo "--- 13) 时间戳单样本缺口(234 tick)：断段/不可信，sync 不得跨缺口拟合 ---"
+PYTHONPATH="$ROOT/tools:$VIBDIR" python3 "$TESTS/assert_tmst_gap.py"
+
+echo "--- 14) 映射导出仅包含已拟合段；允许误差不等于实机相位证据 ---"
+PYTHONPATH="$ROOT/tools:$VIBDIR" python3 "$TESTS/mapped_segment_test.py"
 
 echo
 echo "ROUNDTRIP-ALL-OK ✅"

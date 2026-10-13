@@ -43,6 +43,18 @@ static void slot_pack(writer_slot_t *s, const vib_block_header_t *bh,
     memcpy(s->bytes + offsetof(vib_block_header_t, crc32), &crc, sizeof(crc));
 }
 
+/* 记录**首个**真实 I/O 失败：保留最先出现的非 0 error，不被后续失败覆盖。
+ * 短写/未知失败（errno==0）一律映射为 EIO——非完整写永远不是健康落盘。
+ * 上层（vib_run）据此判定该批次 fatal，绝不返回健康。 */
+static void writer_note_error(writer_t *w, int err)
+{
+    if (err == 0)
+        err = EIO;
+    int expected = 0;
+    atomic_compare_exchange_strong_explicit(&w->error, &expected, err,
+                                            memory_order_relaxed, memory_order_relaxed);
+}
+
 static void *writer_thread(void *arg)
 {
     writer_t *w = (writer_t *)arg;
@@ -60,19 +72,25 @@ static void *writer_thread(void *arg)
         }
 
         if (atomic_load_explicit(&w->error, memory_order_relaxed) != 0) {
-            sleep_us(2000);   /* 已出错：停止消费，让上层看到 dropped 增长 */
+            /* 已出错：停止消费，让上层看到 dropped 增长。
+             * 但 stop 置位后必须能退出——否则队列里还有块时 pthread_join 永不返回
+             * （writer_finish/writer_abort 死锁）。 */
+            if (atomic_load_explicit(&w->stop, memory_order_acquire))
+                break;
+            sleep_us(2000);
             continue;
         }
 
         const writer_slot_t *s = &w->ring[tail % WRITER_RING_SLOTS];
         ssize_t n = write(w->fd, s->bytes, s->len);
         if (n != (ssize_t)s->len) {
-            int e = errno;
-            atomic_store_explicit(&w->error, e, memory_order_relaxed);
+            /* 短写时 errno 可能没被设置（仍为 0）：用 EIO 表示「未完整落盘」 */
+            const int e = (n < 0) ? errno : 0;
+            writer_note_error(w, e);
             vib_block_header_t bh;
             memcpy(&bh, s->bytes, VIB_BLOCK_HEADER_SIZE);
             fprintf(stderr, "[writer] 写盘失败: %s（%zd/%u B，block_index=%u）\n",
-                    strerror(e), n, s->len, bh.block_index);
+                    strerror((n < 0) ? errno : EIO), n, s->len, bh.block_index);
             continue;
         }
 
@@ -88,8 +106,11 @@ static void *writer_thread(void *arg)
 
         if (w->fsync_ms &&
             (mono_ns() - last_fsync) >= (uint64_t)w->fsync_ms * 1000000ull) {
-            if (fdatasync(w->fd) != 0 && errno != EINVAL)
+            /* 周期 fdatasync 失败同样是真实 I/O 失败：EINVAL 也不是「已持久化」的证据 */
+            if (fdatasync(w->fd) != 0) {
+                writer_note_error(w, errno);
                 fprintf(stderr, "[writer] fdatasync 失败: %s\n", strerror(errno));
+            }
             last_fsync = mono_ns();
             w->fsync_count++;
         }
@@ -209,10 +230,17 @@ void writer_finish(writer_t *w, uint32_t final_lost_total)
         uint8_t endbuf[VIB_BLOCK_HEADER_SIZE];
         memcpy(endbuf, &bh, VIB_BLOCK_HEADER_SIZE);
         ssize_t n = write(w->fd, endbuf, VIB_BLOCK_HEADER_SIZE);
-        if (n != VIB_BLOCK_HEADER_SIZE)
-            fprintf(stderr, "[writer] 写结束块失败: %s\n", strerror(errno));
-        else
+        if (n != VIB_BLOCK_HEADER_SIZE) {
+            /* 结束块短写/失败 = 真实 I/O 失败：必须留下非 0 error（短写 errno 可能为 0 → EIO），
+             * 否则 vib_run 会把「没有干净结束块」的落盘当成健康返回。 */
+            const int e = (n < 0) ? errno : 0;
+            writer_note_error(w, e);
+            fprintf(stderr, "[writer] 写结束块失败: %s（%zd/%u B）——"
+                            "文件不完整，解析器将判为「异常掉电/写入失败」\n",
+                    strerror((n < 0) ? errno : EIO), n, (unsigned)VIB_BLOCK_HEADER_SIZE);
+        } else {
             w->bytes_written += VIB_BLOCK_HEADER_SIZE;
+        }
     } else {
         fprintf(stderr, "[writer] 存在写盘错误（errno=%d），未写结束块——"
                         "该文件将被解析器标记为「异常掉电/写入失败」\n",
@@ -220,10 +248,15 @@ void writer_finish(writer_t *w, uint32_t final_lost_total)
     }
 
     if (w->fd >= 0) {
-        if (fdatasync(w->fd) != 0 && errno != EINVAL)
+        /* 收尾 fdatasync/close 失败同样是真实 I/O 失败：EINVAL 也不是「已持久化」的证据 */
+        if (fdatasync(w->fd) != 0) {
+            writer_note_error(w, errno);
             fprintf(stderr, "[writer] 收尾 fdatasync 失败: %s\n", strerror(errno));
-        if (close(w->fd) != 0)
+        }
+        if (close(w->fd) != 0) {
+            writer_note_error(w, errno);
             fprintf(stderr, "[writer] close 失败: %s\n", strerror(errno));
+        }
         w->fd = -1;
     }
 
@@ -242,10 +275,14 @@ void writer_abort(writer_t *w)
     pthread_join(w->th, NULL);
 
     if (w->fd >= 0) {
-        if (fdatasync(w->fd) != 0 && errno != EINVAL)
+        if (fdatasync(w->fd) != 0) {
+            writer_note_error(w, errno);
             fprintf(stderr, "[writer] 中止收尾 fdatasync 失败: %s\n", strerror(errno));
-        if (close(w->fd) != 0)
+        }
+        if (close(w->fd) != 0) {
+            writer_note_error(w, errno);
             fprintf(stderr, "[writer] close 失败: %s\n", strerror(errno));
+        }
         w->fd = -1;
     }
 

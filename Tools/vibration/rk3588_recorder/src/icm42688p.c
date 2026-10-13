@@ -60,8 +60,8 @@ static size_t build_ops(const icm_cfg_t *c, icm_op_t *ops, size_t max)
      *   bit7 HOLD_LAST_DATA_EN 清 0（无效样本不静默复制上一条）
      *   bit6 FIFO_COUNT_REC    置 1（计数按记录，不再除 16 猜单位）
      *   bit5 FIFO_COUNT_ENDIAN 置 1（大端，与 FIFO_COUNTH/L 命名一致）
-     *   bit4 SENSOR_DATA_ENDIAN 清 0 → 小端（格式规范 §1 要求）
-     * 整个字节显式写入并回读校验（c->intf_config0 = 0x60）。 */
+     *   bit4 SENSOR_DATA_ENDIAN 置 1 → **大端**（轴/时间戳统一大端读，消歧义）
+     * 整个字节显式写入并回读校验（c->intf_config0 = 0x70）。 */
     OP(ICM_BANK0, ICM_REG_INTF_CONFIG0, 0xFF, c->intf_config0);
     /* 记录时间戳：TMST_CONFIG=0x33 → RES=0(名义 1µs) + 内部时钟（无 CLKIN），
      * Rev 1.6 §12.7：物理 µs = raw_ticks * 32/30，8 kHz 相邻 raw 差 117/118。 */
@@ -110,7 +110,7 @@ void icm_default_cfg(icm_cfg_t *c)
     c->int_config1      = 0x60;     /* ODR≥4kHz 要求（p.84） */
     c->int_config0      = 0x0A;     /* THS/FULL 在读 FIFO 数据时清除（p.83） */
     c->int_source0      = 0x14;     /* FIFO_THS → INT1（p.84） */
-    c->intf_config0     = 0x60;     /* COUNT_REC=1(按记录)+COUNT_ENDIAN=1(大端)+DATA_ENDIAN=0(小端) */
+    c->intf_config0     = 0x70;     /* COUNT_REC=1(按记录)+COUNT_ENDIAN=1(大端)+DATA_ENDIAN=1(大端) */
 }
 
 uint32_t icm_reg_config_hash(const icm_cfg_t *c)
@@ -256,11 +256,43 @@ int icm_verify_config(icm_t *d, char *report, size_t n)
  * -------------------------------------------------------------------------*/
 int icm_fifo_flush(icm_t *d)
 {
+    /* FIFO_FLUSH 是 SIGNAL_PATH_RESET 的 bit1（0x02）；0x04 是 TMST_STROBE，**不清 FIFO**
+     * （官方 PX4 InvenSense_ICM42688P_registers.hpp SIGNAL_PATH_RESET_BIT 与 TDK 手册
+     * §14.33 一致）。
+     *
+     * 核验策略：active FIFO 会持续采样，不能「1 ms 后要求 count==0」。正确做法是
+     *   1) 把 FIFO 切到 Bypass（停掉输入）→ 2) 写 FIFO_FLUSH=0x02 → 3) 读回 COUNT==0
+     *   → 4) 恢复 Stream-to-FIFO 并读回确认。这样 flush 是否真正生效可被独立验证。 */
+    uint8_t v = 0;
     if (bank_select(d, ICM_BANK0) != 0)
         return -1;
-    if (spi_reg_write(d->spi, ICM_REG_SIGNAL_PATH_RESET, 0x04) != 0)   /* bit2 FIFO_FLUSH（p.61） */
+
+    if (spi_reg_write(d->spi, ICM_REG_FIFO_CONFIG, 0x00) != 0) {  /* FIFO_MODE=00 Bypass */
+        fprintf(stderr, "[icm] FIFO 切 Bypass 失败\n");
         return -1;
+    }
+    if (spi_reg_write(d->spi, ICM_REG_SIGNAL_PATH_RESET, ICM_SPR_FIFO_FLUSH) != 0) {
+        fprintf(stderr, "[icm] 写 FIFO_FLUSH(0x02) 失败\n");
+        return -1;
+    }
     sleep_us(1000);
+    uint16_t raw = 0;
+    if (icm_fifo_count_raw(d, &raw) != 0) {
+        fprintf(stderr, "[icm] 读 FIFO_COUNT 校验 flush 失败\n");
+        return -1;
+    }
+    if (raw != 0) {
+        fprintf(stderr, "[icm] flush 后 FIFO_COUNT=%u ≠ 0（Bypass 下应清空）——flush 未生效\n", raw);
+        return -1;
+    }
+    if (spi_reg_write(d->spi, ICM_REG_FIFO_CONFIG, 0x40) != 0) {  /* Stream-to-FIFO */
+        fprintf(stderr, "[icm] FIFO 恢复 Stream 失败\n");
+        return -1;
+    }
+    if (spi_reg_read(d->spi, ICM_REG_FIFO_CONFIG, &v) != 0 || v != 0x40) {
+        fprintf(stderr, "[icm] FIFO 恢复 Stream 回读不一致（读 0x%02X ≠ 0x40）\n", v);
+        return -1;
+    }
     return 0;
 }
 
@@ -341,15 +373,16 @@ size_t icm_parse_fifo(const uint8_t *raw, size_t nbytes, vib_record_t *out,
 
         vib_record_t r;
         memset(&r, 0, sizeof(r));
-        /* 小端：低字节在前（INTF_CONFIG0 SENSOR_DATA_ENDIAN=0） */
-        r.accel[0] = (int16_t)((uint16_t)f[1] | ((uint16_t)f[2] << 8));
-        r.accel[1] = (int16_t)((uint16_t)f[3] | ((uint16_t)f[4] << 8));
-        r.accel[2] = (int16_t)((uint16_t)f[5] | ((uint16_t)f[6] << 8));
-        r.gyro[0]  = (int16_t)((uint16_t)f[7] | ((uint16_t)f[8] << 8));
-        r.gyro[1]  = (int16_t)((uint16_t)f[9] | ((uint16_t)f[10] << 8));
-        r.gyro[2]  = (int16_t)((uint16_t)f[11] | ((uint16_t)f[12] << 8));
+        /* 大端：高字节在前（INTF_CONFIG0 SENSOR_DATA_ENDIAN=1，0x70）。存盘仍小端，
+         * 因为写入的是本机 int16_t 的 vib_record_t。 */
+        r.accel[0] = (int16_t)(((uint16_t)f[1] << 8) | (uint16_t)f[2]);
+        r.accel[1] = (int16_t)(((uint16_t)f[3] << 8) | (uint16_t)f[4]);
+        r.accel[2] = (int16_t)(((uint16_t)f[5] << 8) | (uint16_t)f[6]);
+        r.gyro[0]  = (int16_t)(((uint16_t)f[7] << 8) | (uint16_t)f[8]);
+        r.gyro[1]  = (int16_t)(((uint16_t)f[9] << 8) | (uint16_t)f[10]);
+        r.gyro[2]  = (int16_t)(((uint16_t)f[11] << 8) | (uint16_t)f[12]);
         r.temp_raw = f[13];
-        r.tmst_raw = (uint16_t)((uint16_t)f[14] | ((uint16_t)f[15] << 8));
+        r.tmst_raw = (uint16_t)(((uint16_t)f[14] << 8) | (uint16_t)f[15]);
 
         if (h & ICM_FIFO_HDR_ODR_ACCEL)
             r.rec_flags |= VIB_RF_ODR_ACCEL_CHG;
@@ -423,7 +456,9 @@ int icm_selftest(icm_t *d, char *report, size_t n)
             intf0, d->count_endian ? "大" : "小");
     }
     if (intf0 & ICM_INTF0_DATA_ENDIAN) {
-        APP("[自检] SENSOR_DATA_ENDIAN=1（大端），与格式规范要求的小端不符 ❌\n");
+        APP("[自检] SENSOR_DATA_ENDIAN=1（大端，轴/时间戳统一大端读）✅\n");
+    } else {
+        APP("[自检] SENSOR_DATA_ENDIAN=0（小端），与期望的大端（INTF_CONFIG0=0x70）不符 ❌\n");
         fail = 1;
     }
 

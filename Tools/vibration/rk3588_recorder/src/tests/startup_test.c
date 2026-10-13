@@ -28,6 +28,7 @@
 #include "icm42688p.h"
 #include "vib_format.h"
 #include "util.h"
+#include "writer.h"
 
 #define MOCK_FIFO_CAP 128
 #define MOCK_RECORD   16
@@ -48,7 +49,23 @@ static struct {
     int flush_count, fail_flush_at;
     int lost_count,   fail_lost_at;
     int count_reads,  fail_count_after;   /* 第 >fail_count_after 次 FIFO_COUNT 读失败 */
+    int fifo_read_count, fail_fifo_read_at; /* 第 fail_fifo_read_at 次 FIFO_DATA 读失败（先采样本再失败） */
 } g;
+
+/* Simulate ring exhaustion after one successfully queued data block. */
+static int inject_host_tail_drop;
+static unsigned int host_tail_drops;
+int __real_writer_submit(writer_t *w, const vib_block_header_t *bh,
+                         const void *payload, size_t len);
+int __wrap_writer_submit(writer_t *w, const vib_block_header_t *bh,
+                         const void *payload, size_t len)
+{
+    if (inject_host_tail_drop && bh->block_index >= 1) {
+        host_tail_drops++;
+        return -1;
+    }
+    return __real_writer_submit(w, bh, payload, len);
+}
 
 static void g_device_reset(void);
 
@@ -77,6 +94,7 @@ static void g_device_reset(void)
     g.flush_count = 0;
     g.lost_count = 0;
     g.count_reads = 0;
+    g.fifo_read_count = 0;
     g.last_ns = mono_ns();
 }
 
@@ -86,6 +104,8 @@ static void g_advance(void)
     const uint64_t el_ns = now - g.last_ns;
     g.last_ns = now;
     if (!g.enabled || el_ns < g.advance_thresh_ns)
+        return;
+    if (((g.reg[0][ICM_REG_FIFO_CONFIG] >> 6) & 0x03u) != 1u)   /* Bypass 不填 FIFO */
         return;
     const uint64_t samples = el_ns / 125000ull;   /* 8 kHz：125 µs/样本 */
     for (uint64_t i = 0; i < samples; i++) {
@@ -97,12 +117,17 @@ static void g_advance(void)
         }
         uint8_t *r = g.fifo + g.fifo_count * MOCK_RECORD;
         r[0] = ICM_FIFO_HDR_ACCEL | ICM_FIFO_HDR_GYRO | ICM_FIFO_HDR_TS_ODR;
-        int16_t ax = 1, ay = 2, az = 3, gx = 4, gy = 5, gz = 6;
-        memcpy(r + 1, &ax, 2); memcpy(r + 3, &ay, 2); memcpy(r + 5, &az, 2);
-        memcpy(r + 7, &gx, 2); memcpy(r + 9, &gy, 2); memcpy(r + 11, &gz, 2);
+        /* 传感器数据按 DATA_ENDIAN=1（**大端**）出线缆。 */
+        const int16_t ax = 1, ay = 2, az = 3, gx = 4, gy = 5, gz = 6;
+        r[1] = (uint8_t)((uint16_t)ax >> 8); r[2]  = (uint8_t)ax;
+        r[3] = (uint8_t)((uint16_t)ay >> 8); r[4]  = (uint8_t)ay;
+        r[5] = (uint8_t)((uint16_t)az >> 8); r[6]  = (uint8_t)az;
+        r[7] = (uint8_t)((uint16_t)gx >> 8); r[8]  = (uint8_t)gx;
+        r[9] = (uint8_t)((uint16_t)gy >> 8); r[10] = (uint8_t)gy;
+        r[11] = (uint8_t)((uint16_t)gz >> 8); r[12] = (uint8_t)gz;
         r[13] = 21;
-        r[14] = (uint8_t)(tmst & 0xFF);
-        r[15] = (uint8_t)(tmst >> 8);
+        r[14] = (uint8_t)(tmst >> 8);
+        r[15] = (uint8_t)(tmst & 0xFF);
         g.fifo_count++;
     }
 }
@@ -144,9 +169,12 @@ static void g_write_byte(uint8_t addr, uint8_t val)
 {
     if (addr == ICM_REG_REG_BANK_SEL) { g.cur_bank = (uint8_t)(val & 0x07); return; }
     if (addr == ICM_REG_DEVICE_CONFIG && (val & 0x01)) { g_device_reset(); return; }
-    if (addr == ICM_REG_SIGNAL_PATH_RESET && (val & 0x04)) {
-        g.flush_count++;
-        g.fifo_count = 0;
+    if (addr == ICM_REG_SIGNAL_PATH_RESET) {
+        /* bit1=0x02 是 FIFO_FLUSH；0x04 是 TMST_STROBE，不清 FIFO。写 1 是自清 strobe。 */
+        if (val & ICM_SPR_FIFO_FLUSH) {
+            g.flush_count++;
+            g.fifo_count = 0;
+        }
         return;
     }
     if (addr == ICM_REG_PWR_MGMT0 && (val & 0x0F) != 0)
@@ -176,6 +204,9 @@ static int mock_xfer(spi_dev_t *d, const uint8_t *tx, uint8_t *rx, size_t len)
                 return -1;                      /* 运行时 FIFO_COUNT 读失败 */
         }
         if (addr == ICM_REG_FIFO_DATA) {
+            g.fifo_read_count++;
+            if (g.fail_fifo_read_at && g.fifo_read_count == g.fail_fifo_read_at)
+                return -1;                      /* 采过样本后 read_fifo 失败 */
             const size_t nbytes = len - 1;
             const size_t nrec = nbytes / MOCK_RECORD;
             size_t take = nrec < g.fifo_count ? nrec : g.fifo_count;
@@ -190,7 +221,7 @@ static int mock_xfer(spi_dev_t *d, const uint8_t *tx, uint8_t *rx, size_t len)
         for (size_t i = 0; i + 1 < len && rx; i++)
             rx[i + 1] = g_read_byte((uint8_t)(addr + i));
     } else {                                   /* 写 */
-        if (addr == ICM_REG_SIGNAL_PATH_RESET && (tx[1] & 0x04) &&
+        if (addr == ICM_REG_SIGNAL_PATH_RESET && (tx[1] & ICM_SPR_FIFO_FLUSH) &&
             g.fail_flush_at && g.flush_count + 1 == g.fail_flush_at)
             return -1;                          /* 第 fail_flush_at 次 flush 写失败 */
         if (len >= 2)
@@ -211,6 +242,35 @@ static long file_size(const char *path)
     if (stat(path, &st) != 0)
         return -1;
     return (long)st.st_size;
+}
+
+/* 扫描块头看是否存在结束块（0xFFFF）。用于断言中止采集不写干净结束块。 */
+static int has_end_block(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    if (fseek(f, VIB_HEADER_SIZE, SEEK_SET) != 0) {
+        fclose(f);
+        return 0;
+    }
+    int found = 0;
+    for (;;) {
+        uint16_t btype = 0, ns = 0;
+        if (fread(&btype, 2, 1, f) != 1)
+            break;
+        if (fread(&ns, 2, 1, f) != 1)
+            break;
+        if (btype == VIB_BLOCK_TYPE_END) {
+            found = 1;
+            break;
+        }
+        /* 跳过块头剩余 28 B + payload（ns*16 B） */
+        if (fseek(f, (long)(28 + (size_t)ns * VIB_RECORD_SIZE), SEEK_CUR) != 0)
+            break;
+    }
+    fclose(f);
+    return found;
 }
 
 static void mk_args(vib_run_args_t *a, spi_dev_t *spi, const char *outdir)
@@ -318,19 +378,69 @@ int main(void)
               "基线失败后文件只有 256 B 头（截断，无结束块，实际 %ld B）", file_size(p));
     }
 
-    printf("== 5) 运行时 FIFO_COUNT 读失败被标记（不当 0 健康）==\n");
+    printf("== 5) 运行时 FIFO_COUNT 读失败 → 中止（不当 0 健康，不留结束块）==\n");
     {
         g_reset();
-        g.fail_count_after = 1;    /* 放行自检里的第 1 次 count 读，之后全部失败 */
+        /* count 读序：自检 flush 验证 1 + 自检窗口 1 + 启动 flush 验证 1 = 3 次，
+         * 第 4 次（主循环第一次）即失败 → 中止。 */
+        g.fail_count_after = 3;
         memset(&g_spi, 0, sizeof(g_spi));
         g_spi.xfer_fn = mock_xfer;
         vib_run_args_t a;
         mk_args(&a, &g_spi, dir);
         a.name[0] = '\0';
         snprintf(a.name, sizeof(a.name), "startup_count_fail");
-        a.seconds = 0.03;          /* 30 ms 后退出（count 持续失败，采集不到样本） */
+        a.seconds = 0.03;
         const int rc = vib_run(&a);
         CHECK(rc == 2, "运行时 count 失败 → 返回 2（健康未知，实际 %d）", rc);
+        char p[1024];
+        snprintf(p, sizeof(p), "%s/startup_count_fail.bin", dir);
+        CHECK(!has_end_block(p), "count 失败后文件无结束块（writer_abort 截断）");
+    }
+
+    printf("== 6) 采过样本后 read_fifo 失败 → 中止（不写干净结束块）==\n");
+    {
+        g_reset();
+        /* FIFO_DATA 读序：自检 1 + 第一次排空 1 = 2 次成功，第 3 次（第二次排空）失败。 */
+        g.fail_fifo_read_at = 3;
+        memset(&g_spi, 0, sizeof(g_spi));
+        g_spi.xfer_fn = mock_xfer;
+        vib_run_args_t a;
+        mk_args(&a, &g_spi, dir);
+        a.name[0] = '\0';
+        snprintf(a.name, sizeof(a.name), "startup_readfifo_fail");
+        a.seconds = 0.20;          /* 足够第一次排空成功（采集到样本）后再失败 */
+        const int rc = vib_run(&a);
+        CHECK(rc == 2, "采过样本后 read_fifo 失败 → 返回 2（实际 %d）", rc);
+        char p[1024];
+        snprintf(p, sizeof(p), "%s/startup_readfifo_fail.bin", dir);
+        CHECK(file_size(p) > (long)(VIB_HEADER_SIZE + VIB_BLOCK_HEADER_SIZE),
+              "已采到部分数据（文件 > 头+块头，实际 %ld B）", file_size(p));
+        CHECK(!has_end_block(p), "read_fifo 失败后文件无结束块（不写干净结束块）");
+    }
+
+    printf("== 7) 尾部队列丢块不能留下健康结束块 ==\n");
+    {
+        g_reset();
+        memset(&g_spi, 0, sizeof(g_spi));
+        g_spi.xfer_fn = mock_xfer;
+        vib_run_args_t a;
+        mk_args(&a, &g_spi, dir);
+        snprintf(a.name, sizeof(a.name), "startup_host_tail_drop");
+        a.seconds = 0.10;
+        host_tail_drops = 0;
+        inject_host_tail_drop = 1;
+        const int rc = vib_run(&a);
+        inject_host_tail_drop = 0;
+        CHECK(rc == 2 && host_tail_drops > 0, "确实注入了尾部丢块，返回 2");
+        char p[1024];
+        snprintf(p, sizeof(p), "%s/startup_host_tail_drop.bin", dir);
+        CHECK(file_size(p) > (long)(VIB_HEADER_SIZE + VIB_BLOCK_HEADER_SIZE),
+              "丢块前有真实写入的数据");
+        CHECK(!has_end_block(p), "尾部丢块后不写健康结束块");
+        unlink(p);
+        snprintf(p, sizeof(p), "%s/startup_host_tail_drop.run.json", dir);
+        unlink(p);
     }
 
     /* 清理测试产物 */
@@ -343,6 +453,8 @@ int main(void)
         snprintf(p, sizeof(p), "%s/startup_baseline_fail.bin", dir); unlink(p);
         snprintf(p, sizeof(p), "%s/startup_count_fail.bin", dir); unlink(p);
         snprintf(p, sizeof(p), "%s/startup_count_fail.run.json", dir); unlink(p);
+        snprintf(p, sizeof(p), "%s/startup_readfifo_fail.bin", dir); unlink(p);
+        snprintf(p, sizeof(p), "%s/startup_readfifo_fail.run.json", dir); unlink(p);
         rmdir(dir);
     }
 

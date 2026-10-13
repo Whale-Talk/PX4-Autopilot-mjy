@@ -48,7 +48,7 @@ typedef struct {
     int               fd;
     pthread_t         th;
     _Atomic int       stop;
-    _Atomic int       error;       /* 首次写盘失败的 errno；非 0 时不再消费 */
+    _Atomic int       error;       /* 首次写入/同步/关闭失败；停止后仍可安全回收线程 */
 } writer_t;
 
 /* 打开文件、写入文件头（含 CRC）、预分配（prealloc_bytes=0 表示不预分配）、起写盘线程 */

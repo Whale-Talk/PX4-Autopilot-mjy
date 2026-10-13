@@ -11,11 +11,16 @@ bin_reader.py — 原始震动数据（格式 v3）解析/校验/统计工具
   2) 完整性判定：block_index 缺号（主机丢块）、FIFO_LOST_PKT 增长（器件丢包）、
      包头 flag（FIFO 满 / 短读 / SPI 读错）、削顶与无效样本比例
   3) 时间基准：tmst 16-bit raw ticks 回绕展开、×32/30 换算物理 µs、
-     「总 ticks/总时间」实测 ODR（不用 1e6/median）
+     「总 ticks/总时间」实测 ODR（不用 1e6/median）。**任何断裂**（重复 Δ==0、
+     大间隔 Δ≥4096、单样本缺口 = Δ∈[1,4096) 但非 117/118（如 234/236）、
+     FIFO header 结构跳过、无效哨兵样本）都把时间轴切开为多个连续段并标记不可信：
+     - 全程 measured_odr_hz 置 None（碎段首尾强拼的 rate 不是可信值），仅留
+       measured_odr_hz_diagnostic 诊断项；逐段速率见 timeline.segments[*]
+     - 断裂处的 Δ 不计入任何段的速率，跨断裂的物理时间不可比（sync 只允许单段拟合）
   4) 物理量：按 ±16 g / ±2000 dps 换算（手册 p.11/p.12），给出各轴 RMS/峰值
   5) 导出：--csv 写逐样本物理量（流式，内存恒定）
 
-退出码：0=无异常；2=检出异常（CRC/缺号/丢包/越窗/削顶超阈）；1=用法或 IO 错误。
+退出码：0=无异常；2=检出异常（CRC/缺号/丢包/越窗/削顶超阈/时间轴断裂）；1=用法或 IO 错误。
 """
 
 from __future__ import annotations
@@ -40,7 +45,10 @@ BLOCK_TYPE_DATA = 0x0001
 BLOCK_TYPE_END = 0xFFFF
 
 CLIP_THRESHOLD = 32760          # |raw| >= 32760 判削顶
-INVALID_SENTINEL = -32766       # 器件「无效样本」哨兵
+INVALID_SENTINEL = -32768       # 器件「无效样本」哨兵 = 0x8000（INT16_MIN）。
+                                # -32766（0x8002）是合法满量程替换值，不是无效。
+                                # 注：本解析器以记录内 rec_flags 的 REC_FLAG_INVALID 为准，
+                                # 该标志由 C 端 icm_parse_fifo 按此哨兵设置。
 TMST_WRAP = 65536               # 16-bit raw ticks 回绕
 TMST_SCALE_NUM = 32             # raw ticks → µs 分子（Rev 1.6 §12.7）
 TMST_SCALE_DEN = 30             # raw ticks → µs 分母
@@ -119,10 +127,15 @@ class RunningStat:
 
 
 class BinReader:
-    def __init__(self, path: str, max_records: int = 0, csv_path: str = None) -> None:
+    def __init__(self, path: str, max_records: int = 0, csv_path: str = None,
+                 t_map: tuple = None, csv_segment_id: int = None) -> None:
         self.path = path
         self.max_records = max_records
         self.csv_path = csv_path
+        # t_map = (slope, intercept)：给 CSV 追加 t_px4_us = slope*t_us + intercept
+        # （供 sync_bin_ulog 在有效 fit 后导出映射过的样本时刻；无 fit 时保持 None）。
+        self.t_map = t_map
+        self.csv_segment_id = csv_segment_id
         self.fh = {}
         self.errors = []          # 硬错误（结构性）
         self.anomalies = []       # 需要人工判断的异常
@@ -153,39 +166,79 @@ class BinReader:
         self.tmst_hist = Counter()
         self.tmst_big = 0
         self.tmst_dup = 0          # 重复时间戳次数（异常，不得静默吞掉）
-        self.tmst_breaks = 0       # 时间轴断裂次数（dup 或 big）
+        self.tmst_gap = 0          # 单样本缺口：[1,4096) 但非 117/118 的 Δ（如 234/236）
+        self.tmst_skips = 0        # 结构跳过（FIFO header msg，不是样本）导致的断裂
+        self.tmst_invalid_breaks = 0  # 无效哨兵记录导致的断裂（其时间戳不作为可信锚点）
+        self.tmst_breaks = 0       # 时间轴断裂次数（dup / big / gap / skip / invalid）
         self.current_segment = 0
-        self.segments = []         # 连续段 [{segment_id, first_us, last_us, samples}]
+        self.segments = []         # 连续段（含逐段 raw ticks / 速率 / 断前类型）
         self.seg_first_us = 0.0
         self.seg_last_us = 0.0
         self.seg_samples = 0
+        self.seg_raw_ticks = 0     # 本段内累计的 raw Δ（**不含**造成断裂的那个 Δ）
+        self.seg_n_deltas = 0
+        self.pending_break_kind = None  # 下一段的 break_before（gap/dup/big/skip/invalid）
         self.tmst_out_of_window = 0
         self.tmst_min = None
         self.tmst_max = None
         self.prev_tmst = None
         self.tmst_raw_total = 0        # Σ 展开后的 raw Δ（整数，规范真源）
         self.tmst_n_deltas = 0         # 参与速率估计的 Δ 数（d ∈ [1,4096)）
-        self.tmst_abs_us = 0.0         # 展开后的物理绝对时间轴（µs，浮点，供 CSV）
+        self.tmst_abs_us = 0.0         # 展开后的物理绝对时间轴（µs，由整数 raw 派生，供 CSV）
         self.ticks_to_us_num = TMST_SCALE_NUM
         self.ticks_to_us_den = TMST_SCALE_DEN
         self.first_t_read_ns = None    # 首个数据块的 t_read（主机采集窗口起点）
         self.last_t_read_ns = None     # 末个数据块的 t_read（主机采集窗口终点）
+        self.first_block_valid_records = None  # 首个数据块的有效记录数（主机采样率要扣除）
         self.end_block_seen = False
         self.axes = {a: RunningStat() for a in AXES}
         self.temp_c = RunningStat()
 
-    def _finalize_segment(self):
-        """关闭当前连续段，开始新段（时间轴在 dup/big 处断裂）。"""
+    @staticmethod
+    def _segment_rate_hz(raw_ticks: int, n_deltas: int, num: int, den: int):
+        """段内速率 = n_deltas / (raw_ticks × num/den × 1e-6)；无从估计时 None。
+
+        **只在单个连续段内**用「总 raw ticks / 总时间」，不把碎段首尾强拼成
+        看似可信的全程 rate（断裂处的 Δ 不计入任何段）。"""
+        if n_deltas <= 0 or raw_ticks <= 0:
+            return None
+        total_us = raw_ticks * num / den
+        if total_us <= 0:
+            return None
+        return round(n_deltas * 1e6 / total_us, 3)
+
+    def _finalize_segment(self, break_kind=None):
+        """关闭当前连续段，并把 break_kind 记为下一段的断前类型（不跨接）。"""
         if self.seg_samples > 0:
             self.segments.append({
                 "segment_id": self.current_segment,
                 "first_us": round(self.seg_first_us, 3),
                 "last_us": round(self.seg_last_us, 3),
                 "samples": self.seg_samples,
+                "raw_ticks": self.seg_raw_ticks,
+                "n_deltas": self.seg_n_deltas,
+                # 段内速率仅由本段 Δ 得出；单段内的样本时刻可信
+                "measured_odr_hz": self._segment_rate_hz(
+                    self.seg_raw_ticks, self.seg_n_deltas,
+                    self.ticks_to_us_num, self.ticks_to_us_den),
+                "break_before": self.pending_break_kind,
+                "trusted": True,
             })
-        self.current_segment += 1
-        self.seg_first_us = self.seg_last_us
-        self.seg_samples = 0
+            self.current_segment += 1
+            self.seg_samples = 0
+            self.seg_raw_ticks = 0
+            self.seg_n_deltas = 0
+            self.seg_first_us = 0.0
+            self.seg_last_us = 0.0
+        self.pending_break_kind = break_kind
+
+    def _break_segment(self, kind):
+        """时间轴断裂：关闭当前段、计数，并让下一段以 kind 开头。
+
+        断裂处**绝不跨接**：造成断裂的那个 Δ（gap）只留在全程诊断时间里，不计入
+        任何段的速率；skip/invalid 连 Δ 都不再计算（prev_tmst 由调用方清零）。"""
+        self.tmst_breaks += 1
+        self._finalize_segment(kind)
 
     # ------------------------------------------------------------------ 头部
     def _read_file_header(self, f) -> None:
@@ -273,7 +326,10 @@ class BinReader:
         csv_f = None
         if self.csv_path:
             csv_f = open(self.csv_path, "w", encoding="utf-8", newline="")
-            csv_f.write("index,segment,t_us," + ",".join(AXES) + ",temp_c,rec_flags\n")
+            if self.t_map is not None:
+                csv_f.write("index,segment,t_us,t_px4_us," + ",".join(AXES) + ",temp_c,rec_flags\n")
+            else:
+                csv_f.write("index,segment,t_us," + ",".join(AXES) + ",temp_c,rec_flags\n")
 
         truncated = False
         with open(self.path, "rb") as f:
@@ -350,6 +406,7 @@ class BinReader:
                 self.samples_total += n_samples
                 self.clip_header_sum += clip_hdr
                 clip_here = 0
+                valid_here = 0
 
                 for off in range(0, nbytes, RECORD_SIZE):
                     ax, ay, az, gx, gy, gz, temp_raw, tmst, rflags = struct.unpack_from(
@@ -365,37 +422,66 @@ class BinReader:
                     if rflags & (REC_FLAG_ODR_ACCEL_CHG | REC_FLAG_ODR_GYRO_CHG):
                         self.odr_change_records += 1
                     if rflags & REC_FLAG_HEADER_MSG:
+                        # 结构跳过：FIFO header 消息不是样本、也不是时间锚点。
+                        # 显式断段并清掉链尾，绝不让 Δ 从断裂一侧算到另一侧。
                         self.bad_records += 1
+                        self.tmst_skips += 1
+                        self._break_segment("skip")
+                        self.prev_tmst = None
                         continue
 
-                    # 时间戳展开：16-bit raw ticks 回绕；物理 µs = raw * 32/30（累加分数）
-                    if self.prev_tmst is not None:
+                    valid_here += 1
+                    invalid_sample = bool(rflags & REC_FLAG_INVALID)
+
+                    if invalid_sample:
+                        # 无效哨兵记录（0x8000）：其时间戳不作为可信锚点 → 断段、不跨接。
+                        # 口径说明：Python 侧比 C 侧保守（C 仍把该记录计入 Δ 链），
+                        # 代价是带无效样本的文件被标记为断续/不可信，而不是静默健康。
+                        self.tmst_invalid_breaks += 1
+                        self._break_segment("invalid")
+                        self.prev_tmst = None
+                    elif self.prev_tmst is not None:
+                        # 时间戳展开：16-bit raw ticks 回绕；物理 µs = raw * 32/30。
+                        # 先整数累计 raw 再派生时间（不逐样本浮点累加，避免漂移）。
                         d = tmst - self.prev_tmst
                         if d < 0:
                             d += TMST_WRAP
                         if d == 0:
                             # 重复时间戳：异常，时间轴断裂，显式标记（不得静默吞掉）
                             self.tmst_dup += 1
-                            self.tmst_breaks += 1
-                            self._finalize_segment()
+                            self._break_segment("dup")
                         elif d >= 4096:
                             self.tmst_big += 1
-                            self.tmst_breaks += 1
-                            self._finalize_segment()
+                            self._break_segment("big")
                         else:
+                            # 全程诊断时间：Δ 一律累计（含 gap），与 C 的 sum_raw_ticks 一致
                             self.tmst_raw_total += d
                             self.tmst_n_deltas += 1
                             self.tmst_hist[d] += 1
-                            if d < TMST_RAW_LO or d > TMST_RAW_HI:
-                                self.tmst_out_of_window += 1
                             if self.tmst_min is None or d < self.tmst_min:
                                 self.tmst_min = d
                             if self.tmst_max is None or d > self.tmst_max:
                                 self.tmst_max = d
-                            self.tmst_abs_us += d * self.ticks_to_us_num / self.ticks_to_us_den
-                            self.seg_last_us = self.tmst_abs_us
-                    self.prev_tmst = tmst
-                    self.seg_samples += 1
+                            # 整数派生：t_us = ΣrawΔ * num/den（不是 += d*num/den 浮点累加）
+                            self.tmst_abs_us = (
+                                self.tmst_raw_total * self.ticks_to_us_num
+                                / self.ticks_to_us_den)
+                            if d < TMST_RAW_LO or d > TMST_RAW_HI:
+                                # 单样本缺口（234/236 raw ticks 等）：时间轴断续。
+                                # 与 C 侧 tmst.c 一致：out_of_window + gap + breaks。
+                                self.tmst_out_of_window += 1
+                                self.tmst_gap += 1
+                                self._break_segment("gap")   # 该 Δ 不计入任何段的速率
+                            else:
+                                self.seg_raw_ticks += d
+                                self.seg_n_deltas += 1
+
+                    if not invalid_sample:
+                        self.prev_tmst = tmst
+                        if self.seg_samples == 0:
+                            self.seg_first_us = self.tmst_abs_us
+                        self.seg_last_us = self.tmst_abs_us
+                        self.seg_samples += 1
 
                     # 物理量
                     self.axes["ax"].push(ax / LSB_PER_G)
@@ -406,15 +492,26 @@ class BinReader:
                     self.axes["gz"].push(gz / LSB_PER_DPS)
                     self.temp_c.push(temp_raw / 2.07 + 25.0)
 
-                    if csv_f:
-                        csv_f.write("%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.3f,%d\n" % (
-                            idx, self.current_segment, self.tmst_abs_us,
-                            ax / LSB_PER_G, ay / LSB_PER_G, az / LSB_PER_G,
-                            gx / LSB_PER_DPS, gy / LSB_PER_DPS, gz / LSB_PER_DPS,
-                            temp_raw / 2.07 + 25.0, rflags))
+                    if csv_f and (self.csv_segment_id is None
+                                  or self.current_segment == self.csv_segment_id):
+                        if self.t_map is not None:
+                            t_px4 = self.t_map[0] * self.tmst_abs_us + self.t_map[1]
+                            csv_f.write("%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.3f,%d\n" % (
+                                idx, self.current_segment, self.tmst_abs_us, t_px4,
+                                ax / LSB_PER_G, ay / LSB_PER_G, az / LSB_PER_G,
+                                gx / LSB_PER_DPS, gy / LSB_PER_DPS, gz / LSB_PER_DPS,
+                                temp_raw / 2.07 + 25.0, rflags))
+                        else:
+                            csv_f.write("%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.3f,%d\n" % (
+                                idx, self.current_segment, self.tmst_abs_us,
+                                ax / LSB_PER_G, ay / LSB_PER_G, az / LSB_PER_G,
+                                gx / LSB_PER_DPS, gy / LSB_PER_DPS, gz / LSB_PER_DPS,
+                                temp_raw / 2.07 + 25.0, rflags))
                     idx += 1
                     self.records += 1
 
+                if self.first_block_valid_records is None:
+                    self.first_block_valid_records = valid_here
                 self.clip_actual += clip_here
                 if clip_here != clip_hdr:
                     self.clip_mismatch_blocks += 1
@@ -455,9 +552,23 @@ class BinReader:
         if self.tmst_dup:
             self.anomalies.append(f"{self.tmst_dup} 处重复时间戳（Δtmst==0）——"
                                   "时间轴断裂，不可信")
+        if self.tmst_gap:
+            self.anomalies.append(
+                f"{self.tmst_gap} 处单样本缺口（raw Δ 落在 [1,4096) 但不是 117/118，"
+                "如 234/236）——时间轴断续、不可信，绝不当全程健康")
+        if self.tmst_skips:
+            self.anomalies.append(
+                f"{self.tmst_skips} 处 FIFO header 结构跳过（不是样本）——"
+                "时间轴在此断裂，不跨接补 Δ")
+        if self.tmst_invalid_breaks:
+            self.anomalies.append(
+                f"{self.tmst_invalid_breaks} 处无效哨兵样本（0x8000）——"
+                "其时间戳不作为可信锚点，时间轴在此断裂")
         if self.tmst_breaks:
-            self.anomalies.append(f"{self.tmst_breaks} 处时间轴断裂（重复或大间隔），"
-                                  "跨段物理时间不可比")
+            self.anomalies.append(
+                f"{self.tmst_breaks} 处时间轴断裂（重复/大间隔/单样本缺口/结构跳过/无效样本），"
+                f"共 {len(self.segments) + 1 if self.seg_samples > 0 else len(self.segments)} "
+                "个连续段：跨段物理时间不可比，全程 rate 不可当可信值")
 
         # 关闭最后一个连续段
         self._finalize_segment()
@@ -486,15 +597,26 @@ class BinReader:
         measured_odr = (n_delta * 1e6 / total_us) if total_us > 0 and n_delta else None
         duration_s = total_us / 1e6 if total_us else 0.0
 
+        # 时间轴是否可信：任何断裂（重复/大间隔/单样本缺口/结构跳过/无效样本）即为不可信。
+        # 不可信时**不**给出「全程 rate」——碎段首尾强拼出来的 rate 不是可信值；
+        # 该值只作为诊断量另行命名上报，逐段速率见 timeline.segments[*].measured_odr_hz。
+        tmst_untrusted = bool(self.tmst_breaks)
+
         # 独立主机采样率：按数据块 t_read（读时刻，非采样时刻）定义的采集窗口，
-        # 不含 writer 关闭耗时；边界不确定度 = FIFO 满窗 16 ms。
+        # 不含 writer 关闭耗时；分母用有效记录（records − invalid），并扣除首批
+        # （首读前已生成的样本）。边界不确定度 = FIFO 满窗 16 ms。
         host_window_s = None
         host_rate_hz = None
+        records_valid = self.records - self.invalid_flag_records
+        first_valid = self.first_block_valid_records or 0
         if (self.first_t_read_ns is not None and self.last_t_read_ns is not None
                 and self.last_t_read_ns > self.first_t_read_ns):
             host_window_s = (self.last_t_read_ns - self.first_t_read_ns) / 1e9
             if host_window_s > 0:
-                host_rate_hz = self.records / host_window_s
+                in_window = records_valid - first_valid
+                if in_window < 0:
+                    in_window = 0
+                host_rate_hz = in_window / host_window_s
 
         self.stats = {
             "file": self.path,
@@ -514,6 +636,8 @@ class BinReader:
                 "spi_err_blocks": self.spi_err_blocks,
                 "bad_record_flags": self.bad_records,
                 "invalid_flag_records": self.invalid_flag_records,
+                "records_valid": records_valid,
+                "first_block_valid_records": self.first_block_valid_records,
                 "odr_change_records": self.odr_change_records,
                 "clip_records": self.clip_actual,
                 "clip_ratio": round(clip_ratio, 8),
@@ -525,26 +649,40 @@ class BinReader:
                 "tmst_median_raw": median_raw,
                 "tmst_median_us": round(median_raw * self.ticks_to_us_num / self.ticks_to_us_den, 3)
                     if median_raw else None,
-                "measured_odr_hz": round(measured_odr, 3) if measured_odr else None,
+                # 仅在时间轴可信（单连续段）时给出全程 rate；否则为 None。
+                "measured_odr_hz": (round(measured_odr, 3)
+                                    if measured_odr and not tmst_untrusted else None),
+                # 不可信时保留「碎段首尾强拼」的诊断值，但显式命名，不得当成可信 rate
+                "measured_odr_hz_diagnostic": (round(measured_odr, 3)
+                                               if measured_odr and tmst_untrusted else None),
+                "rate_trusted": not tmst_untrusted,
                 "nominal_odr_hz": self.fh.get("odr_hz_nominal"),
                 "odr_error_ppm": (round((measured_odr - self.fh["odr_hz_nominal"])
                                         / self.fh["odr_hz_nominal"] * 1e6, 1)
-                                  if measured_odr and self.fh.get("odr_hz_nominal") else None),
+                                  if measured_odr and not tmst_untrusted
+                                  and self.fh.get("odr_hz_nominal") else None),
                 "tmst_raw_min": self.tmst_min,
                 "tmst_raw_max": self.tmst_max,
+                "tmst_raw_total_ticks": self.tmst_raw_total,
                 "tmst_out_of_window": self.tmst_out_of_window,
                 "tmst_out_of_window_ratio": (
                     round(self.tmst_out_of_window / n_delta, 8) if n_delta else 0.0),
                 "tmst_big_delta": self.tmst_big,
                 "tmst_dup": self.tmst_dup,
+                "tmst_gap": self.tmst_gap,
+                "tmst_skips": self.tmst_skips,
+                "tmst_invalid_breaks": self.tmst_invalid_breaks,
                 "tmst_breaks": self.tmst_breaks,
+                "tmst_untrusted": tmst_untrusted,
                 "host_rate_hz": round(host_rate_hz, 3) if host_rate_hz else None,
                 "host_window_s": round(host_window_s, 6) if host_window_s else None,
                 "host_rate_boundary_uncertainty_us": 16000,
             },
             "timeline": {
                 "segments": self.segments,
+                "n_segments": len(self.segments),
                 "tmst_breaks": self.tmst_breaks,
+                "untrusted": tmst_untrusted,
             },
             "physical": {a: self.axes[a].as_dict() for a in AXES},
             "temp": self.temp_c.as_dict(),
@@ -566,9 +704,23 @@ class BinReader:
         p(f"标称档位  : ODR {h['odr_hz_nominal']} Hz  ±{h['fs_accel_g']} g  "
           f"±{h['fs_gyro_dps']} dps  WHO_AM_I={h['who_am_i']}  头CRC={'OK' if h['crc32_ok'] else 'FAIL'}")
         p("-" * 78)
+        rate_txt = (
+            f"{tm['measured_odr_hz']} Hz (偏差 {tm['odr_error_ppm']} ppm)"
+            if tm["rate_trusted"] else
+            f"全程不可信（断裂 {tm['tmst_breaks']} 处；碎段强拼诊断值 "
+            f"{tm['measured_odr_hz_diagnostic']} Hz 仅供参考，看逐段 rate）")
         p(f"记录数    : {ig['records']}   块数: {ig['blocks']}   "
-          f"时长: {tm['duration_s']:.3f} s   实测ODR: {tm['measured_odr_hz']} Hz "
-          f"(偏差 {tm['odr_error_ppm']} ppm)")
+          f"时长: {tm['duration_s']:.3f} s   实测ODR: {rate_txt}")
+        p(f"时间轴    : {'连续' if not tm['tmst_untrusted'] else '断续/不可信'}   "
+          f"连续段 {s['timeline']['n_segments']} 个   "
+          f"缺口(单样本) {tm['tmst_gap']}  重复 {tm['tmst_dup']}  "
+          f"大间隔 {tm['tmst_big_delta']}  结构跳过 {tm['tmst_skips']}  "
+          f"无效样本断裂 {tm['tmst_invalid_breaks']}")
+        if tm["tmst_untrusted"]:
+            for sg in s["timeline"]["segments"]:
+                p(f"    段{sg['segment_id']}: [{sg['first_us']:.0f}, {sg['last_us']:.0f}] µs  "
+                  f"样本 {sg['samples']}  rawΔ {sg['raw_ticks']}  "
+                  f"段内ODR {sg['measured_odr_hz']} Hz  断前 {sg['break_before']}")
         p(f"raw Δ     : 中位 {tm['tmst_median_raw']}（≈{tm['tmst_median_us']} µs）  范围 "
           f"[{tm['tmst_raw_min']}, {tm['tmst_raw_max']}]  "
           f"越窗 {tm['tmst_out_of_window']} ({tm['tmst_out_of_window_ratio']:.4%})  "

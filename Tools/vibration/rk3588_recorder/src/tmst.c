@@ -51,9 +51,14 @@ void tmst_accum_add(tmst_accum_t *t, uint16_t raw)
     if (d < t->dmin) t->dmin = d;
     if (d > t->dmax) t->dmax = d;
 
-    /* raw Δ 窗口：8 kHz 应为 117/118（物理 125 µs），不是 125 */
-    if ((uint32_t)d < VIB_TMST_RAW_LO || (uint32_t)d > VIB_TMST_RAW_HI)
+    /* raw Δ 窗口：8 kHz 应为 117/118（物理 125 µs），不是 125。
+     * 任何落在 [1,4096) 但非 117/118 的 Δ（如 234/236 = 漏掉一个样本）都必须
+     * 计作「缺口」并让时间轴断裂/不可信——不能只当作 out_of_window 诊断继续报告健康。 */
+    if ((uint32_t)d < VIB_TMST_RAW_LO || (uint32_t)d > VIB_TMST_RAW_HI) {
         t->out_of_window++;
+        t->gap++;
+        t->breaks++;
+    }
 }
 
 uint64_t tmst_scale_round_u64(uint64_t ticks)
@@ -101,5 +106,5 @@ int tmst_accum_median_raw(const tmst_accum_t *t)
 
 int tmst_accum_untrusted(const tmst_accum_t *t)
 {
-    return (t->dup != 0) || (t->big != 0);
+    return (t->dup != 0) || (t->big != 0) || (t->gap != 0);
 }

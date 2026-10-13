@@ -25,14 +25,18 @@
 #define VIB_BLOCK_HEADER_SIZE  32
 #define VIB_RECORD_SIZE        16
 #define VIB_SAMPLES_PER_BLOCK  32      /* 512 B payload == FIFO 水位，8 kHz 下约 4 ms */
-#define VIB_DRIVER_VERSION     0x000200 /* major.minor.patch = 0.2.0 */
+#define VIB_DRIVER_VERSION     0x000201 /* major.minor.patch = 0.2.1 */
 
 #define VIB_BLOCK_TYPE_DATA    0x0001
 #define VIB_BLOCK_TYPE_END     0xFFFF
 
 /* ---- 判定阈值（文档 §5） ---- */
 #define VIB_CLIP_THRESHOLD     32760   /* |raw| >= 32760 即判削顶（满量程 -8 LSB） */
-#define VIB_INVALID_SENTINEL   (-32766) /* 器件哨兵：-32768/-32767 被替换值，见手册 p.73 */
+/* 器件无效样本哨兵 = -32768（0x8000，INT16_MIN）。
+ * 手册「Invalid Data Generation」表（归档 text ~2927–2949）与 §14.34：无效数据输出
+ * -32768。**-32766（0x8002）是合法的满量程替换值**，不是无效哨兵——之前把它当哨兵
+ * 正好反了。官方 PX4 ICM42688P.cpp 也以 INT16_MIN（-32768）判无效。 */
+#define VIB_INVALID_SENTINEL   (-32768)
 
 /* ---- ODR 时间戳（手册 p.80 TMST_CONFIG：RES=0 → 名义 1 µs；p.38 记录内 2 B） ---- */
 /* 关键：记录内 16-bit 是「raw ticks」，不是 µs。
@@ -117,8 +121,8 @@ typedef struct __attribute__((packed)) {
  * 对应器件 FIFO Packet 3：Header(1)+Accel(6)+Gyro(6)+Temp(1)+TimeStamp(2) = 16 B
  * -------------------------------------------------------------------------*/
 typedef struct __attribute__((packed)) {
-    int16_t  accel[3];                 /* 0  ax, ay, az（小端） */
-    int16_t  gyro[3];                  /* 6  gx, gy, gz（小端） */
+    int16_t  accel[3];                 /* 0  ax, ay, az（**存盘小端**；线缆上是大端，见 icm_parse_fifo） */
+    int16_t  gyro[3];                  /* 6  gx, gy, gz（**存盘小端**；线缆上是大端） */
     uint8_t  temp_raw;                 /* 12 T[℃] = temp_raw/2.07 + 25（p.24） */
     uint16_t tmst_raw;                 /* 13 ODR 时间戳 raw ticks，16 位回绕；µs = *32/30 */
     uint8_t  rec_flags;                /* 15 VIB_RF_* */

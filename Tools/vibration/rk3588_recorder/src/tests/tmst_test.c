@@ -129,6 +129,36 @@ static void test_dup_big_untrusted(void)
     CHECK(tmst_accum_untrusted(&ok) == 0, "连续 117 序列 → 可信");
 }
 
+static void test_gap_untrusted(void)
+{
+    printf("== 单样本缺口（Δ=234/236）→ 时间轴断裂/不可信 ==\n");
+    /* 反例：234/236 rawticks 是漏掉一个样本的缺口，旧实现只 out_of_window、
+     * 不 untrusted。现在必须断续/不可信。 */
+    tmst_accum_t t;
+    tmst_accum_init(&t);
+    tmst_accum_add(&t, 0);       /* 首样本锚点 */
+    tmst_accum_add(&t, 117);     /* 正常 */
+    tmst_accum_add(&t, 351);     /* 117+234：中间漏一个样本（Δ=234） */
+    CHECK(t.gap == 1, "Δ=234 计作 gap（实际 %llu）", (unsigned long long)t.gap);
+    CHECK(t.out_of_window == 1, "Δ=234 计作 out_of_window（诊断保留）");
+    CHECK(tmst_accum_untrusted(&t) != 0, "单样本缺口 → 不可信");
+
+    /* 236 同理 */
+    tmst_accum_t v;
+    tmst_accum_init(&v);
+    tmst_accum_add(&v, 100);
+    tmst_accum_add(&v, 336);     /* Δ=236 */
+    CHECK(v.gap == 1, "Δ=236 计作 gap");
+    CHECK(tmst_accum_untrusted(&v) != 0, "Δ=236 → 不可信");
+
+    /* 单纯连续 117/118 不应有 gap */
+    tmst_accum_t ok;
+    tmst_accum_init(&ok);
+    for (uint64_t i = 0; i < 200; i++)
+        tmst_accum_add(&ok, synth_raw(i));
+    CHECK(ok.gap == 0, "连续 117/118 序列无 gap（实际 %llu）", (unsigned long long)ok.gap);
+}
+
 int main(void)
 {
     test_nominal_rate();
@@ -136,6 +166,7 @@ int main(void)
     test_wrong_us_assumption();
     test_long_total_no_truncation();
     test_dup_big_untrusted();
+    test_gap_untrusted();
     if (failures) {
         fprintf(stderr, "tmst_test: %d 项失败 ❌\n", failures);
         return 1;

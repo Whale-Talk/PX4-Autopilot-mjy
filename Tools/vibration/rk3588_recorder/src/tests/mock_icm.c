@@ -7,9 +7,11 @@
  *
  * 覆盖（fix 3 的 mock 需求）：
  *   1) 自检的 sub-full 窗口（4 ms）不引发 FIFO 溢出（lost Δ == 0）
- *   2) INTF_CONFIG0 回读：COUNT_REC=1（按记录）、COUNT_ENDIAN=1（大端）、DATA_ENDIAN=0
+ *   2) INTF_CONFIG0 回读：COUNT_REC=1（按记录）、COUNT_ENDIAN=1（大端）、DATA_ENDIAN=1（大端）
  *   3) raw Δ = 117/118（不是 125），自检通过
  *   4) 错误分支：flush 失败 / status/lost 读取失败 → 返回 -1（不得当作 0 健康）
+ *   5) 芯片级：SIGNAL_PATH_RESET 写 0x04（TMST_STROBE）不清 FIFO，0x02（FIFO_FLUSH）才清
+ *   6) 独立 raw-byte 夹具：大端解析 + 无效哨兵 -32768 / -32766 合法满量程
  *
  * 器件模型时间语义：FIFO 在 PWR_MGMT0 使能后按 8 kHz 实时填充（mono_ns 计时，
  * 每次 SPI 访问推进一次），与真实芯片一致——因此 apply_config 的 50 ms 等待会
@@ -54,6 +56,12 @@ static uint16_t mock_lost_value(void)
     return (uint16_t)g.lost;
 }
 
+/* FIFO_CONFIG 位 [7:6] = FIFO_MODE：00=Bypass（不填 FIFO）01=Stream（连续填）。 */
+static int mock_fifo_streaming(void)
+{
+    return (((g.reg[0][ICM_REG_FIFO_CONFIG] >> 6) & 0x03u) == 1u);
+}
+
 static void mock_push_record(void)
 {
     /* 时间戳：raw_cum += 125*30；tmst_raw = raw_cum/32（117/118 交替） */
@@ -66,12 +74,17 @@ static void mock_push_record(void)
     }
     uint8_t *r = g.fifo[g.fifo_count++];
     r[0] = ICM_FIFO_HDR_ACCEL | ICM_FIFO_HDR_GYRO | ICM_FIFO_HDR_TS_ODR;  /* 0x68 */
-    int16_t ax = 1, ay = 2, az = 3, gx = 4, gy = 5, gz = 6;
-    memcpy(r + 1, &ax, 2); memcpy(r + 3, &ay, 2); memcpy(r + 5, &az, 2);
-    memcpy(r + 7, &gx, 2); memcpy(r + 9, &gy, 2); memcpy(r + 11, &gz, 2);
+    /* 传感器数据按 SENSOR_DATA_ENDIAN=1（**大端**）出线缆：高字节在前。 */
+    const int16_t ax = 1, ay = 2, az = 3, gx = 4, gy = 5, gz = 6;
+    r[1] = (uint8_t)((uint16_t)ax >> 8); r[2]  = (uint8_t)ax;
+    r[3] = (uint8_t)((uint16_t)ay >> 8); r[4]  = (uint8_t)ay;
+    r[5] = (uint8_t)((uint16_t)az >> 8); r[6]  = (uint8_t)az;
+    r[7] = (uint8_t)((uint16_t)gx >> 8); r[8]  = (uint8_t)gx;
+    r[9] = (uint8_t)((uint16_t)gy >> 8); r[10] = (uint8_t)gy;
+    r[11] = (uint8_t)((uint16_t)gz >> 8); r[12] = (uint8_t)gz;
     r[13] = 21;
-    r[14] = (uint8_t)(tmst & 0xFF);
-    r[15] = (uint8_t)(tmst >> 8);
+    r[14] = (uint8_t)(tmst >> 8);                  /* 时间戳也大端 */
+    r[15] = (uint8_t)(tmst & 0xFF);
 }
 
 static void mock_advance(void)
@@ -81,6 +94,8 @@ static void mock_advance(void)
     g.last_ns = now;
     if (!g.enabled || el_ns < 1000000ull)             /* < 1 ms 忽略，避免噪声 */
         return;
+    if (!mock_fifo_streaming())
+        return;                                       /* Bypass：不填 FIFO */
     const uint64_t samples = el_ns / 125000ull;        /* 8 kHz：125 µs/样本 */
     for (uint64_t i = 0; i < samples; i++)
         mock_push_record();
@@ -144,8 +159,11 @@ static void mock_write_byte(uint8_t addr, uint8_t val)
         mock_soft_reset();
         return;
     }
-    if (addr == ICM_REG_SIGNAL_PATH_RESET && (val & 0x04)) {
-        g.fifo_count = 0;                              /* FIFO_FLUSH */
+    if (addr == ICM_REG_SIGNAL_PATH_RESET) {
+        /* 手册/PX4 一致：bit1=0x02 才是 FIFO_FLUSH；0x04 是 TMST_STROBE，不清 FIFO。
+         * 写 1 是自清 strobe，不落寄存器。 */
+        if (val & ICM_SPR_FIFO_FLUSH)
+            g.fifo_count = 0;
         return;
     }
     if (addr == ICM_REG_PWR_MGMT0 && (val & 0x0F) != 0) {
@@ -221,12 +239,12 @@ int main(void)
         fprintf(stderr, "%s", report);
     CHECK(rc == 0, "自检通过（%s", report[0] ? "见上" : "报告为空");
 
-    /* 检查 INTF_CONFIG0 的计数单位/端序判定结果（写进 reg[0] 的是 0x60） */
-    CHECK(g.reg[0][ICM_REG_INTF_CONFIG0] == 0x60, "INTF_CONFIG0=0x60（COUNT_REC/COUNT_ENDIAN/DATA_ENDIAN）");
+    /* 检查 INTF_CONFIG0 的计数单位/端序判定结果（写进 reg[0] 的是 0x70） */
+    CHECK(g.reg[0][ICM_REG_INTF_CONFIG0] == 0x70, "INTF_CONFIG0=0x70（COUNT_REC/COUNT_ENDIAN/DATA_ENDIAN 全置）");
     CHECK((g.reg[0][ICM_REG_INTF_CONFIG0] & ICM_INTF0_COUNT_REC) != 0,
           "FIFO_COUNT 按记录计数（COUNT_REC=1）");
-    CHECK((g.reg[0][ICM_REG_INTF_CONFIG0] & ICM_INTF0_DATA_ENDIAN) == 0,
-          "传感器数据小端（DATA_ENDIAN=0）");
+    CHECK((g.reg[0][ICM_REG_INTF_CONFIG0] & ICM_INTF0_DATA_ENDIAN) != 0,
+          "传感器数据大端（DATA_ENDIAN=1，消歧义）");
 
     printf("== 错误分支：flush 失败 ==\n");
     {
@@ -240,6 +258,67 @@ int main(void)
         uint8_t st = 0;
         CHECK(icm_read_status(&icm, &st) != 0, "read_status 在 SPI 失败时返回 -1");
         g_fail_reads = 0;
+    }
+
+    printf("== 芯片级：写 0x04 不清 FIFO，0x02 才清（FIFO_FLUSH=bit1）==\n");
+    {
+        mock_soft_reset();
+        g.enabled = 1;
+        g.reg[0][ICM_REG_FIFO_CONFIG] = 0x40;   /* Stream */
+        mock_push_record();
+        mock_push_record();
+        CHECK(g.fifo_count == 2, "预填 2 条记录");
+        mock_write_byte(ICM_REG_SIGNAL_PATH_RESET, ICM_SPR_TMST_STROBE);  /* 0x04 */
+        CHECK(g.fifo_count == 2, "写 0x04（TMST_STROBE）不清 FIFO（仍 %u 条）", g.fifo_count);
+        mock_write_byte(ICM_REG_SIGNAL_PATH_RESET, ICM_SPR_FIFO_FLUSH);   /* 0x02 */
+        CHECK(g.fifo_count == 0, "写 0x02（FIFO_FLUSH）清空 FIFO（0 条）");
+    }
+
+    printf("== 独立 raw-byte 夹具：大端解析 + 无效哨兵 -32768 / -32766 合法 ==\n");
+    {
+        /* 手工按「手册独立字节常量」构造 16 B Packet 3（线缆大端）。
+         * 不经过 mock 生产逻辑，独立验证 icm_parse_fifo 的字节序与哨兵。 */
+        uint8_t raw[16];
+        memset(raw, 0, sizeof(raw));
+        raw[0]  = ICM_FIFO_HDR_ACCEL | ICM_FIFO_HDR_GYRO | ICM_FIFO_HDR_TS_ODR;  /* 0x68 */
+        raw[1]  = 0x80; raw[2]  = 0x00;   /* accel[0] = 0x8000 = -32768（无效哨兵） */
+        raw[3]  = 0x80; raw[4]  = 0x02;   /* accel[1] = 0x8002 = -32766（合法满量程替换值） */
+        raw[5]  = 0x00; raw[6]  = 0x01;   /* accel[2] = 1 */
+        raw[7]  = 0x00; raw[8]  = 0x04;   /* gyro[0] = 4 */
+        raw[9]  = 0x00; raw[10] = 0x05;   /* gyro[1] = 5 */
+        raw[11] = 0x00; raw[12] = 0x06;   /* gyro[2] = 6 */
+        raw[13] = 21;
+        raw[14] = 0x00; raw[15] = 0x75;   /* tmst = 0x0075 = 117 */
+
+        vib_record_t out[1];
+        uint32_t bad = 0;
+        size_t got = icm_parse_fifo(raw, 16, out, 1, &bad);
+        CHECK(got == 1 && bad == 0, "解析 1 条记录、0 包头异常");
+        CHECK(out[0].accel[0] == -32768, "accel[0] 0x8000 → -32768（无效哨兵）");
+        CHECK(out[0].accel[1] == -32766, "accel[1] 0x8002 → -32766（合法满量程，不误判）");
+        CHECK(out[0].accel[2] == 1, "accel[2] → 1");
+        CHECK(out[0].gyro[0] == 4 && out[0].gyro[2] == 6, "gyro 大端解析正确");
+        CHECK(out[0].tmst_raw == 117, "raw 00 75 → tmst_raw=117");
+        CHECK((out[0].rec_flags & VIB_RF_INVALID) != 0, "含 -32768 → 标记 VIB_RF_INVALID");
+
+        /* 第二条：只有 -32766（无 -32768）→ 不应标无效 */
+        uint8_t raw2[16];
+        memset(raw2, 0, sizeof(raw2));
+        raw2[0] = raw[0];
+        raw2[1] = 0x80; raw2[2] = 0x02;   /* accel[0] = -32766 */
+        raw2[3] = 0x00; raw2[4] = 0x01;   /* accel[1] = 1 */
+        raw2[5] = 0x00; raw2[6] = 0x02;   /* accel[2] = 2 */
+        raw2[7] = 0x00; raw2[8] = 0x04;
+        raw2[9] = 0x00; raw2[10] = 0x05;
+        raw2[11] = 0x00; raw2[12] = 0x06;
+        raw2[13] = 21;
+        raw2[14] = 0x00; raw2[15] = 0xEC;  /* 117+119=236 → 下一条时间戳，仅用于独立性 */
+        vib_record_t out2[1];
+        bad = 0;
+        got = icm_parse_fifo(raw2, 16, out2, 1, &bad);
+        CHECK(got == 1 && bad == 0, "第二条解析 1 条、0 包头异常");
+        CHECK((out2[0].rec_flags & VIB_RF_INVALID) == 0,
+              "仅 -32766（合法满量程）→ 不标无效（哨兵已修正为 -32768）");
     }
 
     if (failures) {

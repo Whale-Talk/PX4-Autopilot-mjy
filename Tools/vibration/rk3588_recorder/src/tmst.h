@@ -32,8 +32,10 @@ typedef struct {
     uint64_t hist[TMST_HIST_N];      /* raw Δ 分布（诊断用） */
     uint64_t big;                    /* Δ >= TMST_HIST_N 的次数（大间隔，时间轴在此断裂） */
     uint64_t dup;                    /* 重复时间戳次数（d==0，异常，不得静默吞掉） */
-    uint64_t breaks;                 /* 时间轴断裂次数（dup 或 big，每处计 1） */
-    uint64_t out_of_window;          /* raw Δ 落在 [117,118] 之外的次数 */
+    uint64_t gap;                    /* Δ 落在 [1,4096) 但非 117/118 的次数：单样本缺口（234/236）
+                                      * 或时钟异常，时间轴必须断裂/不可信（不能只当 out_of_window） */
+    uint64_t breaks;                 /* 时间轴断裂次数（dup 或 big 或 gap，每处计 1） */
+    uint64_t out_of_window;          /* raw Δ 落在 [117,118] 之外的次数（诊断，含 gap） */
     int      dmin;                   /* raw Δ 最小（展开后） */
     int      dmax;                   /* raw Δ 最大（展开后） */
 } tmst_accum_t;
@@ -59,7 +61,7 @@ uint64_t tmst_raw_delta_us(uint32_t raw_delta);
  * 用「先除后乘」避免 raw*num 溢出；sum 为 Σ 展开后的 raw Δ（可超 2^32）。 */
 uint64_t tmst_scale_round_u64(uint64_t ticks);
 
-/* 时间轴是否可信：出现重复时间戳或大间隔（可能隐藏多回绕、断段）时返回非 0。
+/* 时间轴是否可信：出现重复时间戳、大间隔或单样本缺口（非 117/118 的 Δ）时返回非 0。
  * 调用方据此把该批次标记为「时间轴不可信」，不得静默当作全程健康。 */
 int tmst_accum_untrusted(const tmst_accum_t *t);
 
