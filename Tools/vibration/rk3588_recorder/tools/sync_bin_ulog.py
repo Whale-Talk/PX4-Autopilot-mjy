@@ -98,6 +98,7 @@ def read_external(binpath):
         "records": stats["integrity"]["records"],
         "duration_s": timing["duration_s"],
         "t_end_us": round(timing["duration_s"] * 1e6, 1),
+        "format_version": header.get("format_version"),
         "ticks_to_us_num": header.get("tmst_scale_num"),
         "ticks_to_us_den": header.get("tmst_scale_den"),
         "tmst_source": header.get("tmst_source"),
@@ -522,6 +523,17 @@ def main(argv=None):
     ext = read_external(args.bin)
     if ext["errors"]:
         print("错误：外置 .bin 存在结构错误：%s" % ext["errors"], file=sys.stderr)
+        return 2
+    # 物理时间基必须可信才允许映射：legacy v2（无 raw ticks→µs 换算元数据）把 raw 当 µs，
+    # 这只是旧假设、物理时间轴不可信 ⇒ 拒绝，不得据此产出 offset/drift/映射。
+    # （该情形在 bin_reader 里是 anomaly 而非 error，故必须在 errors 之外单独拦。）
+    if (ext.get("format_version") or 0) < 3 or not ext.get("ticks_to_us_num") \
+            or not ext.get("ticks_to_us_den"):
+        print("错误：外置 .bin 无可信的 raw ticks→µs 换算元数据"
+              "（format_version=%s，scale=%s/%s）。legacy v2 的 raw=µs 仅是旧假设，"
+              "物理时间轴不可信 —— 拒绝映射。"
+              % (ext.get("format_version"), ext.get("ticks_to_us_num"),
+                 ext.get("ticks_to_us_den")), file=sys.stderr)
         return 2
     ext_segments = [s for s in ext["segments"] if s.get("samples", 0) > 0]
     if not ext_segments:

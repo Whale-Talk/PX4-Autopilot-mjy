@@ -32,10 +32,14 @@ typedef struct {
     uint64_t hist[TMST_HIST_N];      /* raw Δ 分布（诊断用） */
     uint64_t big;                    /* Δ >= TMST_HIST_N 的次数（大间隔，时间轴在此断裂） */
     uint64_t dup;                    /* 重复时间戳次数（d==0，异常，不得静默吞掉） */
-    uint64_t gap;                    /* Δ 落在 [1,4096) 但非 117/118 的次数：单样本缺口（234/236）
-                                      * 或时钟异常，时间轴必须断裂/不可信（不能只当 out_of_window） */
+    uint64_t gap;                    /* Δ 落在 [1,4096) 但**超出正常窗口**
+                                      * [VIB_TMST_RAW_LO, VIB_TMST_RAW_HI] 的次数：
+                                      * 单样本缺口（234/236）或时钟异常，时间轴必须断裂/
+                                      * 不可信（不能只当 out_of_window）。窗口已含未接 CLKIN
+                                      * 时 ±1% PLL 的 ODR 容差，故规格内偏移不会进这里。 */
     uint64_t breaks;                 /* 时间轴断裂次数（dup 或 big 或 gap，每处计 1） */
-    uint64_t out_of_window;          /* raw Δ 落在 [117,118] 之外的次数（诊断，含 gap） */
+    uint64_t out_of_window;          /* raw Δ 落在正常窗口 [VIB_TMST_RAW_LO, VIB_TMST_RAW_HI]
+                                      * 之外的次数（诊断，含 gap） */
     int      dmin;                   /* raw Δ 最小（展开后） */
     int      dmax;                   /* raw Δ 最大（展开后） */
 } tmst_accum_t;
@@ -61,7 +65,12 @@ uint64_t tmst_raw_delta_us(uint32_t raw_delta);
  * 用「先除后乘」避免 raw*num 溢出；sum 为 Σ 展开后的 raw Δ（可超 2^32）。 */
 uint64_t tmst_scale_round_u64(uint64_t ticks);
 
-/* 时间轴是否可信：出现重复时间戳、大间隔或单样本缺口（非 117/118 的 Δ）时返回非 0。
+/* 时间轴是否可信：出现重复时间戳、大间隔或单样本缺口时返回非 0。此处「单样本缺口」
+ * 指 raw Δ ∈ [1,4096) 但超出正常窗口 [VIB_TMST_RAW_LO, VIB_TMST_RAW_HI]（现为
+ * [115,120]，随 vib_format.h 的宏走；旧注释写的「非 117/118」是已废弃的零容差口径），
+ * 如漏 1 个样本的 234/236。
+ * 该窗口只是「规格内 ODR 抖动 vs 漏样本」的保守判定余量：**不代表实测时钟精度**，
+ * 也**不构成「无丢包」保证**（丢包另由 FIFO_LOST_PKT / block_index / FIFO 满标志判定）。
  * 调用方据此把该批次标记为「时间轴不可信」，不得静默当作全程健康。 */
 int tmst_accum_untrusted(const tmst_accum_t *t);
 

@@ -51,9 +51,11 @@ void tmst_accum_add(tmst_accum_t *t, uint16_t raw)
     if (d < t->dmin) t->dmin = d;
     if (d > t->dmax) t->dmax = d;
 
-    /* raw Δ 窗口：8 kHz 应为 117/118（物理 125 µs），不是 125。
-     * 任何落在 [1,4096) 但非 117/118 的 Δ（如 234/236 = 漏掉一个样本）都必须
-     * 计作「缺口」并让时间轴断裂/不可信——不能只当作 out_of_window 诊断继续报告健康。 */
+    /* raw Δ 正常窗口：名义 117.1875（物理 125 µs），但未接 CLKIN 时 PLL ODR 精度
+     * ±1%，故正常 Δ 可为 116..119（见 vib_format.h 的推导）。任何落在 [1,4096)
+     * 但**超出窗口 [VIB_TMST_RAW_LO, VIB_TMST_RAW_HI]** 的 Δ（如 234/236 = 漏掉
+     * 一个样本）都必须计作「缺口」并让时间轴断裂/不可信——不能只当作 out_of_window
+     * 诊断继续报告健康。窗口上界远小于 2× 名义，故漏样本检测不受容差影响。 */
     if ((uint32_t)d < VIB_TMST_RAW_LO || (uint32_t)d > VIB_TMST_RAW_HI) {
         t->out_of_window++;
         t->gap++;

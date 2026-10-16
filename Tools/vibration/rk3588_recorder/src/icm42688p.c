@@ -486,7 +486,8 @@ int icm_selftest(icm_t *d, char *report, size_t n)
         fail = 1;
     }
 
-    /* ---- 采样时间戳校验：raw Δ 应为 117/118（物理 125 µs），绝不是 125 ---- */
+    /* ---- 采样时间戳校验：raw Δ 必须落在正常窗口（名义 117/118，含 ±1% PLL 容差
+     *      ⇒ 116..119），绝不是 125（那是「把 raw ticks 当 µs」的旧错误口径） ---- */
     if (nrec < 8) {
         APP("[自检] 记录数不足（%d），无法校验时间戳 ❌\n", nrec);
         return -1;
@@ -510,14 +511,15 @@ int icm_selftest(icm_t *d, char *report, size_t n)
     for (size_t i = 0; i < got; i++)
         tmst_accum_add(&ta, recs[i].tmst_raw);
     const int median_raw = tmst_accum_median_raw(&ta);
-    APP("[自检] 解析 %zu 条记录，包头异常 %u 条；raw Δ: 中位=%d（预期 117/118）范围=[%d,%d]\n",
-        got, bad, median_raw, ta.n_deltas ? ta.dmin : 0, ta.n_deltas ? ta.dmax : 0);
+    APP("[自检] 解析 %zu 条记录，包头异常 %u 条；raw Δ: 中位=%d（预期窗口 [%u,%u]）范围=[%d,%d]\n",
+        got, bad, median_raw, VIB_TMST_RAW_LO, VIB_TMST_RAW_HI,
+        ta.n_deltas ? ta.dmin : 0, ta.n_deltas ? ta.dmax : 0);
     if (median_raw < 0) {
         APP("[自检] 无法得到 raw Δ ❌\n");
         fail = 1;
     } else if (median_raw < (int)VIB_TMST_RAW_LO || median_raw > (int)VIB_TMST_RAW_HI) {
-        APP("[自检] raw Δ 中位数 %d 偏离 117/118（若≈125 说明把 raw ticks 当 µs 了）❌\n",
-            median_raw);
+        APP("[自检] raw Δ 中位数 %d 超出正常窗口 [%u,%u]（≈125 说明把 raw ticks 当 µs 了）❌\n",
+            median_raw, VIB_TMST_RAW_LO, VIB_TMST_RAW_HI);
         fail = 1;
     } else {
         APP("[自检] raw Δ 符合 8 kHz 预期（≈%.1f µs → 实测 ODR ≈ %.1f Hz）✅\n",

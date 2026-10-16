@@ -47,8 +47,23 @@
 #define VIB_TMST_WRAP          65536u  /* 16 位 raw ticks 回绕周期 */
 #define VIB_TMST_HALF          32768   /* 回绕展开判定用半周期 */
 #define VIB_TMST_US_NOMINAL    125u    /* 8 kHz 下相邻记录名义物理 Δ（µs，校正后） */
-#define VIB_TMST_RAW_LO        117u    /* 8 kHz 下相邻记录 raw ticks 窗口下界 */
-#define VIB_TMST_RAW_HI        118u    /* 8 kHz 下相邻记录 raw ticks 窗口上界 */
+/* 8 kHz 相邻记录 raw Δ 的「正常窗口」——用于区分正常抖动 vs 漏样本。
+ * 推导（Rev 1.6 §12.7 换算 + 未接 CLKIN 时 PLL ODR 精度 ±1%）：
+ *   名义物理 Δ = 125 µs  →  raw = 125 × 30/32 = 117.1875
+ *   ODR ±1% ⇒ 物理 Δ ∈ [123.7624, 126.2626] µs ⇒ raw ∈ [116.027, 118.371]
+ *   恒定速率下整数差在 floor/ceil 间交替 ⇒ 实测集合 ∈ {116,117}/{117,118}/{118,119}
+ *   上下各放宽 1 tick 只作**保守判定余量** ⇒ 窗口 [115,120]。
+ *     · 这 1 tick 不是「Linux 调度造成 FIFO 内部时间戳变化」：器件 ODR 时间戳由器件
+ *       自身时钟产生，主机调度不改变它；量化误差已由上面的 floor/ceil 交替覆盖。
+ *     · 窗口只是「规格内抖动 vs 漏样本」的判定门限：**不代表实测时钟精度**，
+ *       也**不构成「无丢包」保证**（丢包须由 FIFO_LOST_PKT / block_index / FIFO 满标志判定）。
+ * ⚠️ 上界必须远小于 2× 名义（≈232）：漏 1 个样本的 Δ ≈ 232–237 仍须被判缺口。
+ * ⚠️ 曾经把窗口写成零容差的 {117,118}——那样器件只要偏 0.7% 以上（**完全在 ±1%
+ *    规格内**），约一半 Δ 会被误判为 gap → 整批「时间轴不可信」、自检直接失败。
+ *    反例见 src/tests/tmst_tolerance_test.c 与 tools/tests/assert_tmst_tolerance.py。
+ * ⚠️ 本窗口按 8 kHz 标定；改 ODR 必须同步重算。 */
+#define VIB_TMST_RAW_LO        115u    /* 8 kHz 正常 raw Δ 下界（含 ±1% ODR 容差） */
+#define VIB_TMST_RAW_HI        120u    /* 8 kHz 正常 raw Δ 上界（含 ±1% ODR 容差） */
 #define VIB_TMST_TOL_US        1u      /* 换算后物理窗口 = 名义值 ±1 µs */
 
 /* ---- 时间戳时钟源 / 分辨率（写入文件头，见 vib_file_header_t） ---- */

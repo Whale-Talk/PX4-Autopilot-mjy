@@ -123,5 +123,16 @@ PYTHONPATH="$ROOT/tools:$VIBDIR" python3 "$TESTS/assert_tmst_gap.py"
 echo "--- 14) 映射导出仅包含已拟合段；允许误差不等于实机相位证据 ---"
 PYTHONPATH="$ROOT/tools:$VIBDIR" python3 "$TESTS/mapped_segment_test.py"
 
+echo "--- 15) 规格内 ODR 偏移（±1% PLL）不得判缺口/不可信：C 侧反例（生产 tmst.c）---"
+gcc -O2 -Wall -Wextra -Wshadow -Wconversion -Werror -std=gnu11 -I"$SRC" \
+    -o "$OUT/tmst_tol" "$SRC/tests/tmst_tolerance_test.c" "$SRC/tmst.c"
+"$OUT/tmst_tol"
+
+echo "--- 16) 同上，解析器侧反例（真实 VIB3 字节 fixture + 独立复算）---"
+PYTHONPATH="$ROOT/tools:$VIBDIR" python3 "$TESTS/assert_tmst_tolerance.py"
+
+echo "--- 17) legacy v2（raw=µs 旧假设）必须被同步工具在读 ULog 前拒绝 ---"
+PYTHONPATH="$ROOT/tools:$VIBDIR" python3 "$TESTS/assert_legacy_refused.py"
+
 echo
 echo "ROUNDTRIP-ALL-OK ✅"

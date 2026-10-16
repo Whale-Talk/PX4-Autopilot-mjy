@@ -12,7 +12,7 @@ bin_reader.py — 原始震动数据（格式 v3）解析/校验/统计工具
      包头 flag（FIFO 满 / 短读 / SPI 读错）、削顶与无效样本比例
   3) 时间基准：tmst 16-bit raw ticks 回绕展开、×32/30 换算物理 µs、
      「总 ticks/总时间」实测 ODR（不用 1e6/median）。**任何断裂**（重复 Δ==0、
-     大间隔 Δ≥4096、单样本缺口 = Δ∈[1,4096) 但非 117/118（如 234/236）、
+     大间隔 Δ≥4096、单样本缺口 = Δ∈[1,4096) 但超出正常窗口 [115,120]（如 234/236）、
      FIFO header 结构跳过、无效哨兵样本）都把时间轴切开为多个连续段并标记不可信：
      - 全程 measured_odr_hz 置 None（碎段首尾强拼的 rate 不是可信值），仅留
        measured_odr_hz_diagnostic 诊断项；逐段速率见 timeline.segments[*]
@@ -53,8 +53,17 @@ TMST_WRAP = 65536               # 16-bit raw ticks 回绕
 TMST_SCALE_NUM = 32             # raw ticks → µs 分子（Rev 1.6 §12.7）
 TMST_SCALE_DEN = 30             # raw ticks → µs 分母
 TMST_US_NOMINAL = 125           # 8 kHz 名义物理 Δ（µs，换算后）
-TMST_RAW_LO = 117               # 8 kHz 相邻 raw Δ 窗口下界
-TMST_RAW_HI = 118               # 8 kHz 相邻 raw Δ 窗口上界
+# 8 kHz 相邻 raw Δ「正常窗口」。未接 CLKIN 时 PLL ODR 精度 ±1%（数据格式规范 §4）：
+# 物理 Δ ∈ [123.7624, 126.2626] µs → raw ∈ [116.03, 118.37] → 整数差落在
+# {116,117} / {117,118} / {118,119}；量化误差已由该 floor/ceil 交替覆盖，
+# 上下各放宽 1 tick 只作**保守判定余量** ⇒ [115,120]（不是「Linux 调度造成 FIFO
+# 内部时间戳变化」——器件 ODR 时间戳由器件自身时钟产生，主机调度不改变它）。
+# 窗口只是「规格内抖动 vs 漏样本」的判定门限：**不代表实测时钟精度**，也**不构成
+# 无丢包保证**（丢包须由 FIFO_LOST_PKT / block_index / FIFO 满标志独立判定）。
+# 漏 1 个样本 ⇒ Δ ≈ 232–237，仍在窗口外（上界必须远小于 232）。
+# 必须与 C 端 vib_format.h 的 VIB_TMST_RAW_LO/HI 一致；按 8 kHz 标定。
+TMST_RAW_LO = 115
+TMST_RAW_HI = 120
 
 LSB_PER_G = 2048.0              # ±16 g（手册 p.11）
 LSB_PER_DPS = 16.4              # ±2000 dps（手册 p.12）
@@ -166,7 +175,7 @@ class BinReader:
         self.tmst_hist = Counter()
         self.tmst_big = 0
         self.tmst_dup = 0          # 重复时间戳次数（异常，不得静默吞掉）
-        self.tmst_gap = 0          # 单样本缺口：[1,4096) 但非 117/118 的 Δ（如 234/236）
+        self.tmst_gap = 0          # 单样本缺口：[1,4096) 但超出正常窗口（如 234/236）
         self.tmst_skips = 0        # 结构跳过（FIFO header msg，不是样本）导致的断裂
         self.tmst_invalid_breaks = 0  # 无效哨兵记录导致的断裂（其时间戳不作为可信锚点）
         self.tmst_breaks = 0       # 时间轴断裂次数（dup / big / gap / skip / invalid）
@@ -554,8 +563,9 @@ class BinReader:
                                   "时间轴断裂，不可信")
         if self.tmst_gap:
             self.anomalies.append(
-                f"{self.tmst_gap} 处单样本缺口（raw Δ 落在 [1,4096) 但不是 117/118，"
-                "如 234/236）——时间轴断续、不可信，绝不当全程健康")
+                f"{self.tmst_gap} 处单样本缺口（raw Δ 在 [1,4096) 但超出正常窗口 "
+                f"[{TMST_RAW_LO},{TMST_RAW_HI}]，如 234/236）——时间轴断续、不可信，"
+                "绝不当全程健康")
         if self.tmst_skips:
             self.anomalies.append(
                 f"{self.tmst_skips} 处 FIFO header 结构跳过（不是样本）——"
