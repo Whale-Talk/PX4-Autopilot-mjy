@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-assert_tmst_tolerance.py — 反例（Python 侧）：规格内 ODR 偏移不得判「缺口/不可信」
+assert_tmst_tolerance.py — 反例（Python 侧）：名义附近的整数时基偏移不得判「缺口/不可信」
 
 与 src/tests/tmst_tolerance_test.c 对应，验证**解析器侧**（bin_reader）与生产
-时间基准同一口径：未接 CLKIN 的 PLL ODR 精度 ±1%（见 数据格式规范 §4），
-故正常 raw Δ 可以是 116..119；只有真正的漏样本（≈2× 名义 ≈232–237）才算缺口。
+时间基准同一口径：未接 CLKIN 时 ODR 走芯片内部标称时基换算（物理 µs = raw ticks
+× 30/32，8 kHz 名义 raw ≈ 117.1875，整数差 117/118 交替，实机只见 117/118）。
+
+判定窗口 [115, 120] 是**现选用的保守诊断门限**，只用于区分「名义附近的量化/抖动」
+与「漏样本」；本测试用**名义附近的整数偏移**（±1.0%，即 8080/7920 Hz fixture 输入）
+覆盖它。⚠️ **不得由窗口反推时钟容差**：TDK DS-000347 Rev1.6 表 4（CLK_SEL=01 且
+gyro active 初始容差 ±1.5%）与 p.24 §4.10（±1%）条件不同，**不能**把绝对钟差直接
+等同**同一芯片内相邻 raw Δ 的变化**、也不得硬套进本 tick 窗口；绝对时钟误差只能靠
+**外部参考**判定，也不得据此声明绝对 8000 Hz 已校准（时间基口径见 timing.timebase）。
 
 fixture 复用 assert_tmst_gap.write_vib3 的**真实字节**写入路径（逐块 CRC 实算），
 只把名义间隔改成目标 ODR —— 不复制解析逻辑。
@@ -48,16 +55,16 @@ def main():
     tmp = tempfile.mkdtemp(prefix="tmst_tol_")
     nrec = 8000
 
-    print("== 窗口常量必须覆盖 ±1% PLL 规格 ==")
+    print("== 窗口常量必须覆盖名义附近的整数 raw Δ（现选用的保守诊断门限）==")
     check(br.TMST_RAW_LO <= 116,
-          "TMST_RAW_LO=%d ≤ 116（容纳 ODR +1%% 的 Δ=116）" % br.TMST_RAW_LO)
+          "TMST_RAW_LO=%d ≤ 116（容纳名义附近整数偏移 fixture 的 Δ=116）" % br.TMST_RAW_LO)
     check(br.TMST_RAW_HI >= 119,
-          "TMST_RAW_HI=%d ≥ 119（容纳 ODR -1%% 的 Δ=119）" % br.TMST_RAW_HI)
+          "TMST_RAW_HI=%d ≥ 119（容纳名义附近整数偏移 fixture 的 Δ=119）" % br.TMST_RAW_HI)
     check(br.TMST_RAW_HI < 232,
           "TMST_RAW_HI=%d < 232（漏样本 2× 名义仍在窗口外）" % br.TMST_RAW_HI)
 
-    for rate, label in ((8000, "名义"), (8080, "+1.0%"), (7920, "-1.0%")):
-        print("== ODR %d Hz（%s）==" % (rate, label))
+    for rate, label in ((8000, "名义"), (8080, "fixture +1.0%"), (7920, "fixture -1.0%")):
+        print("== ODR %d Hz（%s；名义附近整数偏移 fixture 输入）==" % (rate, label))
         path = build(os.path.join(tmp, "tol_%d.bin" % rate), nrec, rate)
         st = br.BinReader(path).run()
         tm = st["timing"]
@@ -68,12 +75,12 @@ def main():
         check(tm["tmst_breaks"] == 0,
               "无时间轴断裂（实际 %s）" % tm["tmst_breaks"])
         check(tm["tmst_untrusted"] == 0,
-              "时间轴可信（不得因规格内 ODR 偏移判不可信）")
+              "时间轴可信（不得因名义附近时基偏移判不可信）")
         check(tm["tmst_out_of_window"] == 0,
               "无越窗（实际 %s）" % tm["tmst_out_of_window"])
         meas = tm["measured_odr_hz"]
         check(meas is not None and abs(meas - rate) / rate < 0.003,
-              "实测 ODR ≈ %d Hz（实际 %s）" % (rate, meas))
+              "标称时基换算速率 ≈ %d Hz（实际 %s）" % (rate, meas))
         check(st["ok"], "整体判定 OK")
 
         # 注入真实缺口（漏 1 样本 ⇒ 2× 名义）仍必须断段

@@ -112,7 +112,11 @@ int main(int argc, char **argv)
         strftime(rc.name, sizeof(rc.name), "vib_%y%m%dT%H%M%SZ", &tmv);
     }
 
-    fprintf(stderr, "=== 原始震动采集 v0.2.0（数据格式 v%d）===\n", VIB_FORMAT_VERSION);
+    /* banner 版本从 VIB_DRIVER_VERSION 派生（major<<16|minor<<8|patch），不再写死，
+     * 避免与 vib_format.h 的驱动版本漂移。 */
+    fprintf(stderr, "=== 原始震动采集 v%u.%u.%u（数据格式 v%d）===\n",
+            (VIB_DRIVER_VERSION >> 16) & 0xFFu, (VIB_DRIVER_VERSION >> 8) & 0xFFu,
+            VIB_DRIVER_VERSION & 0xFFu, VIB_FORMAT_VERSION);
     fprintf(stderr, "设备=%s  SPI=%u Hz  mode=%u  输出=%s/%s.bin\n",
             rc.dev, rc.spi_hz, rc.spi_mode, rc.outdir, rc.name);
 

@@ -47,23 +47,26 @@
 #define VIB_TMST_WRAP          65536u  /* 16 位 raw ticks 回绕周期 */
 #define VIB_TMST_HALF          32768   /* 回绕展开判定用半周期 */
 #define VIB_TMST_US_NOMINAL    125u    /* 8 kHz 下相邻记录名义物理 Δ（µs，校正后） */
-/* 8 kHz 相邻记录 raw Δ 的「正常窗口」——用于区分正常抖动 vs 漏样本。
- * 推导（Rev 1.6 §12.7 换算 + 未接 CLKIN 时 PLL ODR 精度 ±1%）：
- *   名义物理 Δ = 125 µs  →  raw = 125 × 30/32 = 117.1875
- *   ODR ±1% ⇒ 物理 Δ ∈ [123.7624, 126.2626] µs ⇒ raw ∈ [116.027, 118.371]
- *   恒定速率下整数差在 floor/ceil 间交替 ⇒ 实测集合 ∈ {116,117}/{117,118}/{118,119}
- *   上下各放宽 1 tick 只作**保守判定余量** ⇒ 窗口 [115,120]。
- *     · 这 1 tick 不是「Linux 调度造成 FIFO 内部时间戳变化」：器件 ODR 时间戳由器件
- *       自身时钟产生，主机调度不改变它；量化误差已由上面的 floor/ceil 交替覆盖。
- *     · 窗口只是「规格内抖动 vs 漏样本」的判定门限：**不代表实测时钟精度**，
- *       也**不构成「无丢包」保证**（丢包须由 FIFO_LOST_PKT / block_index / FIFO 满标志判定）。
+/* 8 kHz 相邻记录 raw Δ 的「正常窗口」——**现选用的保守诊断门限**，不是时钟精度指标。
+ * 口径（Rev 1.6 §12.7 换算）：
+ *   名义物理 Δ = 125 µs  →  raw = 125 × 30/32 = 117.1875（整数差 117/118 交替）
+ *   实机相邻 raw Δ 目前只见 117/118；[115,120] 只是本实现**当前选定**的保守诊断门限，
+ *   用于区分「名义附近的量化/抖动」与「漏样本」，integer fixture 以名义附近的整数偏移
+ *   （Δ=116、Δ=119 这类名义附近整数偏移）覆盖测试（见 src/tests/tmst_tolerance_test.c）。
+ *     · ⚠️ **不得由本窗口反推时钟容差**：绝对钟差（例如 TDK Rev1.6 表 4 给出
+ *       CLK_SEL=01 且 gyro active 的初始容差 ±1.5%，及 p.24 §4.10 另述的 ±1%——
+ *       两者条件不同）**不能**直接等同**同一芯片内相邻 raw Δ 的变化**；不得把
+ *       「绝对钟差」硬套进本 tick 窗口，也不得据此声明绝对物理 ODR 已校准。
+ *       **绝对时钟误差只能靠外部参考**（run.c 的 host_rate_hz 等独立速率）判定。
+ *     · 窗口**不代表实测时钟精度**，也**不构成「无丢包」保证**（丢包须由
+ *       FIFO_LOST_PKT / block_index / FIFO 满标志判定）。
  * ⚠️ 上界必须远小于 2× 名义（≈232）：漏 1 个样本的 Δ ≈ 232–237 仍须被判缺口。
- * ⚠️ 曾经把窗口写成零容差的 {117,118}——那样器件只要偏 0.7% 以上（**完全在 ±1%
- *    规格内**），约一半 Δ 会被误判为 gap → 整批「时间轴不可信」、自检直接失败。
+ * ⚠️ 曾经把窗口写成零容差的 {117,118}——那样只要名义附近出现 Δ=116/119 这类整数偏移
+ *    （fixture 即可复现），约一半 Δ 会被误判为 gap → 整批「时间轴不可信」、自检失败。
  *    反例见 src/tests/tmst_tolerance_test.c 与 tools/tests/assert_tmst_tolerance.py。
  * ⚠️ 本窗口按 8 kHz 标定；改 ODR 必须同步重算。 */
-#define VIB_TMST_RAW_LO        115u    /* 8 kHz 正常 raw Δ 下界（含 ±1% ODR 容差） */
-#define VIB_TMST_RAW_HI        120u    /* 8 kHz 正常 raw Δ 上界（含 ±1% ODR 容差） */
+#define VIB_TMST_RAW_LO        115u    /* 8 kHz 正常 raw Δ 下界（现选用的保守诊断门限） */
+#define VIB_TMST_RAW_HI        120u    /* 8 kHz 正常 raw Δ 上界（现选用的保守诊断门限） */
 #define VIB_TMST_TOL_US        1u      /* 换算后物理窗口 = 名义值 ±1 µs */
 
 /* ---- 时间戳时钟源 / 分辨率（写入文件头，见 vib_file_header_t） ---- */
@@ -138,7 +141,13 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     int16_t  accel[3];                 /* 0  ax, ay, az（**存盘小端**；线缆上是大端，见 icm_parse_fifo） */
     int16_t  gyro[3];                  /* 6  gx, gy, gz（**存盘小端**；线缆上是大端） */
-    uint8_t  temp_raw;                 /* 12 T[℃] = temp_raw/2.07 + 25（p.24） */
+    uint8_t  temp_raw;                 /* 12 **存盘是原始 uint8 字节**（v3 布局/CRC 不变）。
+                                        * 物理温度须按**有符号 8 位**二补码解释：
+                                        * TEMP_DATA = (temp_raw >= 128) ? temp_raw-256 : temp_raw，
+                                        * T[℃] = TEMP_DATA/2.07 + 25（手册 p.25/p.66，signed/2.07+25）。
+                                        * 例：0x00→25 ℃、0xFF→24.5169 ℃、0xF9→21.6184 ℃。
+                                        * 本实现不据温度值置任何 invalid 标志：手册 p.25/p.66
+                                        * 未给出可依赖的 8 位温度「无效」编码，不引入未证实判定。 */
     uint16_t tmst_raw;                 /* 13 ODR 时间戳 raw ticks，16 位回绕；µs = *32/30 */
     uint8_t  rec_flags;                /* 15 VIB_RF_* */
 } vib_record_t;

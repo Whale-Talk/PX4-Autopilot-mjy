@@ -14,6 +14,9 @@
  *   4) 「已验证清空 + 丢包基线」——放在所有慢速准备之后，准备期溢出不会进入采集
  *   5) 排空循环
  * 时间戳口径：记录内 16-bit 是 raw ticks，µs = raw*32/30（Rev 1.6 §12.7）。
+ * **时基口径**：summary 里的 odr/measured_odr_hz 是「芯片内部标称时基换算速率」
+ * （内部时钟、未接 CLKIN、未做绝对时钟校准），不能读成独立绝对实测 ODR；独立参考
+ * 量是 host_rate_hz（数据块 t_read 窗口）。两者不一致不换算系数、不放宽漂移门限。
  * 主循环是纯轮询（FIFO_COUNT + sleep），未接 GPIO 中断线，勿宣称 IRQ 驱动。
  * ==========================================================================*/
 #define _GNU_SOURCE
@@ -53,6 +56,9 @@ typedef struct {
     uint64_t clip_samples;
     uint32_t bad_records;
     uint32_t spi_read_errors;     /* status/lost/count 读取失败次数（不得当作 0 健康） */
+    uint32_t short_blocks;        /* records < 水位的块数：信息级（正常不足水位排空），
+                                   * 不是丢包证据；真实丢失看 device_lost_pkt /
+                                   * host_dropped_blocks / spi_read_errors / runtime_fault */
     int      runtime_fault;       /* 运行时 count/read_fifo/lost 失败：不能正常结束 */
     uint64_t first_read_ns;       /* 首次排空读完成时刻（0=未发生） */
     uint64_t last_read_ns;        /* 最近一次排空读完成时刻 */
@@ -129,8 +135,13 @@ static int drain_once(icm_t *icm, writer_t *w, run_stat_t *rs, tmst_accum_t *ts)
         bh.flags |= VIB_BF_FIFO_FULL;
     if (st_ok != 0 || lost_ok != 0)
         bh.flags |= VIB_BF_SPI_ERR;        /* 本块 FIFO 健康未知 */
-    if (recs < (int)(icm->cfg.wm_bytes / VIB_RECORD_SIZE))
-        bh.flags |= VIB_BF_SHORT_READ;
+    if (recs < (int)(icm->cfg.wm_bytes / VIB_RECORD_SIZE)) {
+        bh.flags |= VIB_BF_SHORT_READ;   /* 信息级：本批不足水位即排空（正常收尾/兜底排空
+                                          * 都会命中），**不含**丢包信息——器件丢包看
+                                          * FIFO_LOST_PKT，主机丢块看 block_index，传输
+                                          * 失败走 VIB_BF_SPI_ERR / runtime_fault。 */
+        rs->short_blocks++;
+    }
 
     if (writer_submit(w, &bh, recs_out, got * VIB_RECORD_SIZE) != 0)
         rs->host_dropped_blocks++;        /* ⇒ 解析器会看到 block_index 缺号 */
@@ -332,7 +343,7 @@ int vib_run(const vib_run_args_t *a)
             const double odr = tmst_accum_rate_hz(&ts);
             fprintf(stderr,
                     "[run] %6.1f s | 样本 %llu | 块 %u | 丢块 %u | 器件丢包 %u | "
-                    "削顶 %llu | 实测ODR %.1f Hz | 越窗 %llu | 重复 %llu | SPI读错 %u\n",
+                    "削顶 %llu | 时基换算 %.1f Hz | 越窗 %llu | 重复 %llu | SPI读错 %u\n",
                     (double)(mono_ns() - t0) / 1e9,
                     (unsigned long long)rs.samples, rs.block_index,
                     rs.host_dropped_blocks, rs.device_lost_pkt,
@@ -404,9 +415,13 @@ int vib_run(const vib_run_args_t *a)
             (unsigned long long)collected, (unsigned long long)(valid_total),
             (unsigned long long)invalid, (unsigned long long)written,
             (unsigned long long)unwritten, rs.block_index);
-    fprintf(stderr, "实测 ODR    : %.2f Hz（总 raw ticks/总时间；raw Δ 中位=%d，标称 %u Hz）\n",
+    fprintf(stderr, "时基换算速率: %.2f Hz（总 raw ticks/总时间；raw Δ 中位=%d，标称 %u Hz；"
+                    "字段名沿用 odr/measured_odr_hz 以保持兼容）\n",
             odr, median_raw, icm.cfg.odr_hz);
-    fprintf(stderr, "主机采样率  : %.2f Hz（采集窗口 %llu ns；边界不确定度 ±%u µs = FIFO 满窗）\n",
+    fprintf(stderr, "            ↑ 口径：芯片内部标称时基换算（raw*32/30，未接 CLKIN，"
+                    "**未做绝对时钟校准**），不是独立绝对实测；独立参考见下行主机采样率\n");
+    fprintf(stderr, "主机采样率  : %.2f Hz（采集窗口 %llu ns；独立于芯片时基；"
+                    "边界不确定度 ±%u µs = FIFO 满窗）\n",
             host_rate_hz, (unsigned long long)host_window_ns, VIB_FIFO_FULL_WINDOW_US);
     fprintf(stderr, "raw Δ 范围  : [%d, %d]；越窗 %llu/%llu；重复 %llu；大间隔 %llu；缺口 %llu；断裂 %llu；%s\n",
             ts.n_deltas ? ts.dmin : 0, ts.n_deltas ? ts.dmax : 0,
@@ -419,6 +434,9 @@ int vib_run(const vib_run_args_t *a)
     fprintf(stderr, "削顶样本    : %llu\n", (unsigned long long)rs.clip_samples);
     fprintf(stderr, "包头异常    : %u\n", rs.bad_records);
     fprintf(stderr, "SPI 读错    : %u（status/lost 读取失败，健康未知）\n", rs.spi_read_errors);
+    fprintf(stderr, "短读块      : %u（records<水位的正常不足水位排空，信息级提示；"
+                    "非数据丢失证据——器件丢包 %u、主机丢块 %u）\n",
+            rs.short_blocks, rs.device_lost_pkt, rs.host_dropped_blocks);
     fprintf(stderr, "写盘        : %llu B / %llu 块 / fsync %llu 次 / errno %d\n",
             (unsigned long long)wr.bytes_written, (unsigned long long)wr.blocks_written,
             (unsigned long long)wr.fsync_count, writer_error(&wr));
@@ -443,6 +461,23 @@ int vib_run(const vib_run_args_t *a)
             "  \"spi_mode\": %u,\n"
             "  \"odr_hz_nominal\": %u,\n"
             "  \"odr_hz_measured\": %.3f,\n"
+            "  \"timebase\": {\n"
+            "    \"kind\": \"chip_nominal_scale\",\n"
+            "    \"tmst_scale_num\": %u,\n"
+            "    \"tmst_scale_den\": %u,\n"
+            "    \"tmst_source\": %u,\n"
+            "    \"tmst_res\": %u,\n"
+            "    \"raw_delta_window_lo\": %u,\n"
+            "    \"raw_delta_window_hi\": %u,\n"
+            "    \"absolute_clock_calibrated\": false,\n"
+            "    \"note\": \"odr_hz_measured 是芯片内部标称时基的换算速率(raw*32/30，未接 CLKIN)，未做绝对时钟校准，不得声明绝对物理 8000 Hz 已校准；独立参考量见 host_rate_hz\",\n"
+            "    \"reference_independent_rate\": \"host_rate_hz\"\n"
+            "  },\n"
+            "  \"notices\": [\n"
+            "    {\"kind\": \"short_read\", \"severity\": \"info\",\n"
+            "     \"note\": \"records<水位的正常不足水位排空（如收尾批次），非数据丢失证据；器件丢包看 device_lost_pkt_final，主机丢块看 host_dropped_blocks，传输失败看 spi_read_errors/runtime_fault\",\n"
+            "     \"blocks\": %u}\n"
+            "  ],\n"
             "  \"watermark_bytes\": %u,\n"
             "  \"reg_config_hash\": %u,\n"
             "  \"who_am_i\": %u,\n"
@@ -473,6 +508,7 @@ int vib_run(const vib_run_args_t *a)
             "    \"tmst_untrusted\": %d,\n"
             "    \"runtime_fault\": %d,\n"
             "    \"spi_read_errors\": %u,\n"
+            "    \"short_read_blocks\": %u,\n"
             "    \"writer_errno\": %d,\n"
             "    \"fsync_count\": %llu\n"
             "  }\n"
@@ -480,7 +516,12 @@ int vib_run(const vib_run_args_t *a)
             binpath, iso, (double)host_window_ns / 1e9, host_rate_hz,
             VIB_FIFO_FULL_WINDOW_US,
             a->dev, a->spi_hz, a->spi_mode,
-            icm.cfg.odr_hz, odr, icm.cfg.wm_bytes, icm.reg_hash,
+            icm.cfg.odr_hz, odr,
+            VIB_TMST_SCALE_NUM, VIB_TMST_SCALE_DEN,
+            (unsigned)fh.tmst_source, (unsigned)fh.tmst_res,
+            VIB_TMST_RAW_LO, VIB_TMST_RAW_HI,
+            rs.short_blocks,
+            icm.cfg.wm_bytes, icm.reg_hash,
             icm.who_am_i, a->frame,
             selftest_pass ? "true" : "false", esc,
             (unsigned long long)collected, (unsigned long long)valid_total,
@@ -495,6 +536,7 @@ int vib_run(const vib_run_args_t *a)
             untrusted ? 1 : 0,
             rs.runtime_fault ? 1 : 0,
             rs.spi_read_errors,
+            rs.short_blocks,
             writer_error(&wr), (unsigned long long)wr.fsync_count);
         fclose(f);
         fprintf(stderr, "运行日志    : %s\n", runlog);
@@ -510,6 +552,12 @@ int vib_run(const vib_run_args_t *a)
     if (!a->spi)
         spi_close(spi);
 
+    /* 致命判据：真实错误/丢包/时间轴断裂才 exit 2。
+     * 短读（rs.short_blocks）**故意不在**这里：生产 drain 读到 recs<水位是正常排空，
+     * 不构成丢失证据；若把短读也算致命，收尾批与兜底排空会把健康采集误判为失败。
+     * 真实 SPI 错误（spi_read_errors/runtime_fault）、FIFO 满/丢块（host_dropped_blocks）、
+     * 器件丢包（device_lost_pkt）、坏包头（bad_records）、坏 CRC/未结束（由解析器负责）
+     * 仍然一律致命。 */
     const int fatal = writer_error(&wr) != 0 || rs.host_dropped_blocks > 0 ||
                       rs.device_lost_pkt > lost0 || rs.bad_records > 0 ||
                       rs.spi_read_errors > 0 || rs.runtime_fault ||

@@ -51,11 +51,16 @@ void tmst_accum_add(tmst_accum_t *t, uint16_t raw)
     if (d < t->dmin) t->dmin = d;
     if (d > t->dmax) t->dmax = d;
 
-    /* raw Δ 正常窗口：名义 117.1875（物理 125 µs），但未接 CLKIN 时 PLL ODR 精度
-     * ±1%，故正常 Δ 可为 116..119（见 vib_format.h 的推导）。任何落在 [1,4096)
-     * 但**超出窗口 [VIB_TMST_RAW_LO, VIB_TMST_RAW_HI]** 的 Δ（如 234/236 = 漏掉
-     * 一个样本）都必须计作「缺口」并让时间轴断裂/不可信——不能只当作 out_of_window
-     * 诊断继续报告健康。窗口上界远小于 2× 名义，故漏样本检测不受容差影响。 */
+    /* raw Δ 正常窗口：名义 117.1875（物理 125 µs），实机只见 117/118。
+     * 窗口 [VIB_TMST_RAW_LO, VIB_TMST_RAW_HI] = [115,120] 是**现选用的保守诊断门限**，
+     * 只用来区分「名义附近的量化/抖动」与「漏样本」；integer fixture 以名义附近的整数
+     * 偏移（Δ=116、Δ=119 这类名义附近整数偏移）覆盖测试（见 tests/tmst_tolerance_test.c）。
+     * ⚠️ 不得由本窗口反推时钟容差：绝对钟差（TDK Rev1.6 表 4 的 ±1.5%、p.24 §4.10 的
+     * ±1%，条件不同）**不能**直接等同**同一芯片内相邻 raw Δ 的变化**；绝对时钟误差须
+     * 靠外部参考判定（run.c 的 host_rate_hz），本窗口不构成任何时钟精度宣称。
+     * 任何落在 [1,4096) 但**超出窗口**的 Δ（如 234/236 = 漏掉一个样本）都必须计作
+     * 「缺口」并让时间轴断裂/不可信——不能只当作 out_of_window 诊断继续报告健康。
+     * 窗口上界远小于 2× 名义，故漏样本检测不受该门限影响。 */
     if ((uint32_t)d < VIB_TMST_RAW_LO || (uint32_t)d > VIB_TMST_RAW_HI) {
         t->out_of_window++;
         t->gap++;

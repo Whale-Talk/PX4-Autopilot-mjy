@@ -10,7 +10,9 @@
  *   accel[0] = 32767 当 i % clip_every == 0，否则 1000
  *   accel[1] = -2000   accel[2] = 2048
  *   gyro[0]  = 164     gyro[1]  = 0     gyro[2] = -16
- *   temp_raw = 21      rec_flags = 0
+ *   temp_raw = 0xF9（存盘是**原始 uint8 字节**；物理温度须按有符号 8 位二补码解释：
+ *              0xF9 → −7 → 21.6184 ℃，覆盖负温度分支；正值分支见 assert_hw_bytes.py）
+ *              rec_flags = 0
  *   tmst_raw = (i * 125*30/32) & 0xFFFF  （严格 8 kHz：物理 125 µs/样本 →
  *               raw ticks 117/118 交替，经历多次 16 位回绕）
  *   每 32 条一数据块；lost_pkt_total = 0
@@ -97,7 +99,7 @@ int main(int argc, char **argv)
             r.gyro[0]  = 164;
             r.gyro[1]  = 0;
             r.gyro[2]  = -16;
-            r.temp_raw = 21;
+            r.temp_raw = 0xF9;         /* 原样存 uint8 字节；二补码 ⇒ −7 → 21.6184 ℃ */
             r.tmst_raw = (uint16_t)(((uint64_t)i * (uint64_t)VIB_TMST_US_NOMINAL
                                       * (uint64_t)VIB_TMST_SCALE_DEN
                                       / (uint64_t)VIB_TMST_SCALE_NUM) & 0xFFFFull);

@@ -9,18 +9,27 @@ bin_reader.py — 原始震动数据（格式 v3）解析/校验/统计工具
 职责：
   1) 结构校验：magic / version / 尺寸 / 文件头与每个块的 CRC
   2) 完整性判定：block_index 缺号（主机丢块）、FIFO_LOST_PKT 增长（器件丢包）、
-     包头 flag（FIFO 满 / 短读 / SPI 读错）、削顶与无效样本比例
+     包头 flag（FIFO 满 / SPI 读错）、削顶与无效样本比例。
+     短读（SHORT_READ = records < watermark）在生产路径只表示「正常排空到一个
+     不足水位的批」，是信息级 notice，不是数据丢失证据（真实传输失败另有
+     SPI_ERR 路径；器件丢包看 FIFO_LOST_PKT，主机丢块看 block_index）。
   3) 时间基准：tmst 16-bit raw ticks 回绕展开、×32/30 换算物理 µs、
-     「总 ticks/总时间」实测 ODR（不用 1e6/median）。**任何断裂**（重复 Δ==0、
+     「总 ticks/总时间」**标称时基换算速率**（芯片内部标称时基，非独立绝对实测；
+     stats.timebase 显式标注未做绝对时钟校准），不用 1e6/median。**任何断裂**（重复 Δ==0、
      大间隔 Δ≥4096、单样本缺口 = Δ∈[1,4096) 但超出正常窗口 [115,120]（如 234/236）、
      FIFO header 结构跳过、无效哨兵样本）都把时间轴切开为多个连续段并标记不可信：
      - 全程 measured_odr_hz 置 None（碎段首尾强拼的 rate 不是可信值），仅留
        measured_odr_hz_diagnostic 诊断项；逐段速率见 timeline.segments[*]
      - 断裂处的 Δ 不计入任何段的速率，跨断裂的物理时间不可比（sync 只允许单段拟合）
-  4) 物理量：按 ±16 g / ±2000 dps 换算（手册 p.11/p.12），给出各轴 RMS/峰值
+  4) 物理量：按 ±16 g / ±2000 dps 换算（手册 p.11/p.12），给出各轴 RMS/峰值；
+     温度按 p.25/66 公式 T[℃] = TEMP_DATA/2.07 + 25，TEMP_DATA 是**有符号 8 位**
+     （二补码：≥128 减 256）。本工具不据温度值做任何失效判定——手册 p.25/66
+     未给出可依赖的 8 位温度「无效」编码
   5) 导出：--csv 写逐样本物理量（流式，内存恒定）
 
-退出码：0=无异常；2=检出异常（CRC/缺号/丢包/越窗/削顶超阈/时间轴断裂）；1=用法或 IO 错误。
+退出码：0=无异常；2=检出异常（CRC/缺号/丢包/越窗/削顶超阈/时间轴断裂/短读以外的
+真实 SPI 错/未结束）；1=用法或 IO 错误。短读只是一条 notice（见 stats.notices），
+不单独把健康采集判成异常。
 """
 
 from __future__ import annotations
@@ -53,17 +62,26 @@ TMST_WRAP = 65536               # 16-bit raw ticks 回绕
 TMST_SCALE_NUM = 32             # raw ticks → µs 分子（Rev 1.6 §12.7）
 TMST_SCALE_DEN = 30             # raw ticks → µs 分母
 TMST_US_NOMINAL = 125           # 8 kHz 名义物理 Δ（µs，换算后）
-# 8 kHz 相邻 raw Δ「正常窗口」。未接 CLKIN 时 PLL ODR 精度 ±1%（数据格式规范 §4）：
-# 物理 Δ ∈ [123.7624, 126.2626] µs → raw ∈ [116.03, 118.37] → 整数差落在
-# {116,117} / {117,118} / {118,119}；量化误差已由该 floor/ceil 交替覆盖，
-# 上下各放宽 1 tick 只作**保守判定余量** ⇒ [115,120]（不是「Linux 调度造成 FIFO
-# 内部时间戳变化」——器件 ODR 时间戳由器件自身时钟产生，主机调度不改变它）。
-# 窗口只是「规格内抖动 vs 漏样本」的判定门限：**不代表实测时钟精度**，也**不构成
-# 无丢包保证**（丢包须由 FIFO_LOST_PKT / block_index / FIFO 满标志独立判定）。
+# 8 kHz 相邻 raw Δ 的「正常窗口」——**现选用的保守诊断门限**，不是时钟精度指标：
+# 名义换算得 raw ≈ 117.1875（物理 125 µs ⇒ 整数差 117/118 交替），实机相邻 raw Δ
+# 目前只见 117/118。窗口 [115,120] 只是本工具**当前选定**的保守诊断门限，用于区分
+# 「名义附近的量化/抖动」与「漏样本」；integer fixture 用名义附近的整数偏移
+# （Δ=116、Δ=119 这类名义附近整数偏移）覆盖测试，全部落在本窗口内（见 tools/tests/assert_tmst_tolerance.py）。
+# ⚠️ **不得由本窗口反推时钟容差**：绝对钟差（例如 TDK Rev1.6 表 4 给出 CLK_SEL=01 且
+# gyro active 的初始容差 ±1.5%，及 p.24 §4.10 另述的 ±1%——两者条件不同）**不能**
+# 直接等同**同一芯片内相邻 raw Δ 的变化**；绝对时钟误差只能靠**外部参考**（本工具的
+# host_rate_hz 等独立速率）判定，本窗口不构成任何时钟精度宣称。
+# 本窗口只是「名义附近抖动 vs 漏样本」的门限，**不构成无丢包保证**
+# （丢包须由 FIFO_LOST_PKT / block_index / FIFO 满标志独立判定）。
 # 漏 1 个样本 ⇒ Δ ≈ 232–237，仍在窗口外（上界必须远小于 232）。
 # 必须与 C 端 vib_format.h 的 VIB_TMST_RAW_LO/HI 一致；按 8 kHz 标定。
 TMST_RAW_LO = 115
 TMST_RAW_HI = 120
+# 温度（手册 p.25/p.66）：TEMP_DATA 有符号 8 位，T[℃] = TEMP_DATA/2.07 + 25。
+# 盘上是 uint8 原始字节（v3 布局/CRC 不变），解析时才按二补码还原符号。
+# 不定义、也不使用任何温度「无效」哨兵常量（无手册/固件级证据）。
+TEMP_LSB_PER_C = 2.07
+TEMP_OFFSET_C = 25.0
 
 LSB_PER_G = 2048.0              # ±16 g（手册 p.11）
 LSB_PER_DPS = 16.4              # ±2000 dps（手册 p.12）
@@ -135,6 +153,17 @@ class RunningStat:
         }
 
 
+def temp_raw_to_c(temp_raw: int) -> float:
+    """盘上 uint8 温度字节 → 物理 ℃（手册 p.25/p.66）。
+
+    v3 记录的 temp 字段是**原始字节**（布局/CRC 不变）；物理温度按**有符号 8 位**
+    二补码解释：≥128 减 256（如 0xFF → −1 → 24.5169 ℃，0xF9 → −7 → 21.6184 ℃），
+    再套 T = TEMP_DATA/2.07 + 25。CSV 与统计共用本函数，避免两条路径口径分叉。
+    """
+    return ((temp_raw - 256) if temp_raw >= 128 else temp_raw) / TEMP_LSB_PER_C \
+        + TEMP_OFFSET_C
+
+
 class BinReader:
     def __init__(self, path: str, max_records: int = 0, csv_path: str = None,
                  t_map: tuple = None, csv_segment_id: int = None) -> None:
@@ -148,6 +177,7 @@ class BinReader:
         self.fh = {}
         self.errors = []          # 硬错误（结构性）
         self.anomalies = []       # 需要人工判断的异常
+        self.notices = []         # 信息级提示（正常但值得记录，不影响 ok/退出码）
         self.stats = {}
         self._reset_counters()
 
@@ -327,6 +357,26 @@ class BinReader:
         if who != 0x47:
             self.anomalies.append(f"文件头 who_am_i=0x{who:02X}，期望 0x47")
 
+    def _timebase_labels(self) -> tuple:
+        """(source, kind)：时基元数据的**来源标签**——只认 v3 的显式元数据。
+
+        - v3 且换算 scale 元数据齐全：tmst_source==0 → "internal"（内部标称时基），
+          非 0（CLKIN）→ "clkin"（随后仍按原样被拒绝）；kind 一律 "chip_nominal_scale"。
+        - legacy v2 / 换算元数据缺失：文件头 64..75 处当年是 reserved，那里的字节
+          （常为 0，也可能是任意残留值）**不是**时钟源元数据。此时一律
+          source="unknown"、kind="legacy_unknown"：**绝不用 tmst_source 的取值去标
+          clkin/internal**（否则 v2 的 reserved 残留字节会被冒充成外部钟），也不让
+          「raw=µs 旧假设」冒充 "chip_nominal_scale"（标称标定）。
+        """
+        fh = self.fh
+        has_meta = (fh.get("format_version", 0) >= 3
+                    and fh.get("tmst_scale_num", 0) > 0
+                    and fh.get("tmst_scale_den", 0) > 0)
+        if not has_meta or fh.get("tmst_source") is None:
+            return "unknown", "legacy_unknown"
+        source = "internal" if fh.get("tmst_source") == 0 else "clkin"
+        return source, "chip_nominal_scale"
+
     # ------------------------------------------------------------------ 主循环
     def run(self) -> dict:
         if os.path.getsize(self.path) < FILE_HEADER_SIZE:
@@ -499,7 +549,8 @@ class BinReader:
                     self.axes["gx"].push(gx / LSB_PER_DPS)
                     self.axes["gy"].push(gy / LSB_PER_DPS)
                     self.axes["gz"].push(gz / LSB_PER_DPS)
-                    self.temp_c.push(temp_raw / 2.07 + 25.0)
+                    temp_c = temp_raw_to_c(temp_raw)
+                    self.temp_c.push(temp_c)
 
                     if csv_f and (self.csv_segment_id is None
                                   or self.current_segment == self.csv_segment_id):
@@ -509,13 +560,13 @@ class BinReader:
                                 idx, self.current_segment, self.tmst_abs_us, t_px4,
                                 ax / LSB_PER_G, ay / LSB_PER_G, az / LSB_PER_G,
                                 gx / LSB_PER_DPS, gy / LSB_PER_DPS, gz / LSB_PER_DPS,
-                                temp_raw / 2.07 + 25.0, rflags))
+                                temp_c, rflags))
                         else:
                             csv_f.write("%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.3f,%d\n" % (
                                 idx, self.current_segment, self.tmst_abs_us,
                                 ax / LSB_PER_G, ay / LSB_PER_G, az / LSB_PER_G,
                                 gx / LSB_PER_DPS, gy / LSB_PER_DPS, gz / LSB_PER_DPS,
-                                temp_raw / 2.07 + 25.0, rflags))
+                                temp_c, rflags))
                     idx += 1
                     self.records += 1
 
@@ -544,7 +595,13 @@ class BinReader:
             self.anomalies.append(f"{self.fifo_full_blocks} 个块记录到 FIFO 满"
                                   "（采样期间排空不及，存在不可恢复的器件丢包）")
         if self.short_blocks:
-            self.anomalies.append(f"{self.short_blocks} 个块为短读（未达水位即排空）")
+            # 短读（SHORT_READ）：生产 drain 只要读到 records < 水位就置该 flag，正常
+            # 收尾的最后一批（以及 3 ms 兜底排空的不足水位批）都会命中，本身**不含**
+            # 丢包信息（器件丢包看 FIFO_LOST_PKT，主机丢块看 block_index，传输失败看
+            # SPI_ERR）。故如实保留计数，但只作信息级 notice，不单独判异常。
+            self.notices.append(
+                f"{self.short_blocks} 个块为短读（records < 水位；生产路径的正常不足"
+                "水位排空，非数据丢失证据，另见 FIFO_LOST_PKT/缺块/SPI 错）")
         if self.spi_err_blocks:
             self.anomalies.append(f"{self.spi_err_blocks} 个块 status/lost 读取失败"
                                   "（FIFO 健康未知，不能当作 0 丢包）")
@@ -592,8 +649,10 @@ class BinReader:
 
     # ------------------------------------------------------------------ 汇总
     def _finalize(self, device_lost: int, clip_ratio: float) -> None:
-        # 实测 ODR 用「总 raw ticks / 总物理时间」估计，不用 1e6/median
+        # 时基换算速率用「总 raw ticks / 总物理时间」估计，不用 1e6/median
         # （对 117/118 抖动更稳健，且保留全程信息；与 C 端 tmst.c 一致）。
+        # ⚠️ 这是**芯片内部标称时基的换算速率**（raw*32/30），不是独立绝对实测：
+        # 未做绝对时钟校准，独立参考量是 host_rate_hz（数据块 t_read 窗口）。
         n_delta = self.tmst_n_deltas
         median_raw = None
         if n_delta:
@@ -627,6 +686,10 @@ class BinReader:
                 if in_window < 0:
                     in_window = 0
                 host_rate_hz = in_window / host_window_s
+
+        # 时基来源标签：只由 v3 的显式元数据得出；缺元数据 → source=unknown /
+        # kind=legacy_unknown（不按 tmst_source 取值去标 internal/clkin）
+        tb_source, tb_kind = self._timebase_labels()
 
         self.stats = {
             "file": self.path,
@@ -687,6 +750,29 @@ class BinReader:
                 "host_rate_hz": round(host_rate_hz, 3) if host_rate_hz else None,
                 "host_window_s": round(host_window_s, 6) if host_window_s else None,
                 "host_rate_boundary_uncertainty_us": 16000,
+                # 机器可读时基元数据：显式声明 measured_odr_hz 的**来源与校准状态**，
+                # 避免把「芯片标称时基换算」读成「独立绝对实测 ODR」。字段名保持兼容，
+                # 但语义以本块为准。source/kind 只认 v3 的显式元数据：legacy v2（或换算
+                # 元数据缺失）一律 source="unknown"/kind="legacy_unknown"（reserved 字节
+                # 非 0 也不据此标 clkin），绝不让它冒充 internal/clkin 或
+                # chip_nominal_scale（见 _timebase_labels）。
+                "timebase": {
+                    "kind": tb_kind,
+                    "source": tb_source,
+                    "metadata_present": tb_kind != "legacy_unknown",
+                    "tmst_res": self.fh.get("tmst_res"),
+                    "conversion": "raw_ticks*%d/%d"
+                                  % (self.ticks_to_us_num, self.ticks_to_us_den),
+                    "raw_delta_window": ([TMST_RAW_LO, TMST_RAW_HI]
+                                         if tb_kind != "legacy_unknown" else None),
+                    "raw_delta_window_note":
+                        "现选用的保守诊断门限（名义附近抖动 vs 漏样本），非时钟精度"
+                        "指标；绝对钟差不得由本窗口反推、须另用外部参考，且不得据此"
+                        "声明绝对 8000 Hz 已校准",
+                    "absolute_clock_calibrated": False,
+                    "reference_independent_rate": "host_rate_hz",
+                    "independent_rate_hz": (round(host_rate_hz, 3) if host_rate_hz else None),
+                },
             },
             "timeline": {
                 "segments": self.segments,
@@ -698,6 +784,7 @@ class BinReader:
             "temp": self.temp_c.as_dict(),
             "errors": self.errors,
             "anomalies": self.anomalies,
+            "notices": self.notices,
             "ok": not self.errors and not self.anomalies,
         }
 
@@ -715,12 +802,25 @@ class BinReader:
           f"±{h['fs_gyro_dps']} dps  WHO_AM_I={h['who_am_i']}  头CRC={'OK' if h['crc32_ok'] else 'FAIL'}")
         p("-" * 78)
         rate_txt = (
-            f"{tm['measured_odr_hz']} Hz (偏差 {tm['odr_error_ppm']} ppm)"
+            f"{tm['measured_odr_hz']} Hz (与标称偏差 {tm['odr_error_ppm']} ppm)"
             if tm["rate_trusted"] else
             f"全程不可信（断裂 {tm['tmst_breaks']} 处；碎段强拼诊断值 "
             f"{tm['measured_odr_hz_diagnostic']} Hz 仅供参考，看逐段 rate）")
         p(f"记录数    : {ig['records']}   块数: {ig['blocks']}   "
-          f"时长: {tm['duration_s']:.3f} s   实测ODR: {rate_txt}")
+          f"时长: {tm['duration_s']:.3f} s   时基换算速率: {rate_txt}")
+        tb = tm.get("timebase") or {}
+        if tb.get("kind") == "chip_nominal_scale" and tb.get("source") == "internal":
+            tb_txt = (f"芯片内部标称时基换算（{tb.get('conversion', 'raw*32/30')}，"
+                      f"源=internal）")
+        elif tb.get("kind") == "legacy_unknown":
+            tb_txt = (f"无换算元数据/legacy（kind=legacy_unknown，source=unknown；"
+                      f"换算 {tb.get('conversion')} 仅是旧假设）—— 物理时间轴不可信")
+        else:
+            tb_txt = (f"{tb.get('kind')}（{tb.get('conversion')}，"
+                      f"源={tb.get('source')}，本实现不支持该时钟源）")
+        p(f"时基口径  : {tb_txt} —— **未做绝对时钟校准**，"
+          f"不得声明绝对 8000 Hz 已校准；绝对钟差须另用外部参考；独立参考速率 host_rate="
+          f"{tb.get('independent_rate_hz')} Hz")
         p(f"时间轴    : {'连续' if not tm['tmst_untrusted'] else '断续/不可信'}   "
           f"连续段 {s['timeline']['n_segments']} 个   "
           f"缺口(单样本) {tm['tmst_gap']}  重复 {tm['tmst_dup']}  "
@@ -738,7 +838,7 @@ class BinReader:
         p(f"丢包      : 器件 FIFO_LOST_PKT {ig['device_lost_pkt_first']} → "
           f"{ig['device_lost_pkt_last']} (Δ{ig['device_lost_pkt_delta']})   "
           f"主机缺块 {ig['missing_blocks']}({ig['block_index_gaps']} 处)   "
-          f"FIFO满块 {ig['fifo_full_blocks']}  短读块 {ig['short_blocks']}")
+          f"FIFO满块 {ig['fifo_full_blocks']}  短读块 {ig['short_blocks']}（信息级）")
         p(f"数据质量  : 削顶 {ig['clip_records']} ({ig['clip_ratio']:.4%})   "
           f"无效标志 {ig['invalid_flag_records']}   包头异常 {ig['bad_record_flags']}   "
           f"块CRC错 {ig['block_crc_errors']}   结束块 {'有' if ig['end_block_seen'] else '缺失'}")
@@ -760,13 +860,17 @@ class BinReader:
             p("异常（需人工判断）：")
             for e in s["anomalies"]:
                 p(f"  ! {e}")
+        if s.get("notices"):
+            p("提示（信息级，不影响判定）：")
+            for e in s["notices"]:
+                p(f"  · {e}")
         if s["ok"]:
             p("结论：结构与完整性校验通过 ✅（是否可用于分析仍取决于台架/飞行口径）")
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        description="原始震动数据（格式 v2）解析/校验/统计",
+        description="原始震动数据（格式 v3）解析/校验/统计",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("files", nargs="+", help=".bin 文件（可多个）")
     ap.add_argument("--json", nargs="?", const="-", default=None,
@@ -797,10 +901,14 @@ def main(argv=None) -> int:
 
         results.append(st)
         if args.quiet:
+            # odr= 仍是实测字段名（兼容既有脚本），但口径是**芯片标称时基换算速率**
+            # （timebase.absolute_clock_calibrated=False）；host= 才是独立参考速率。
             print(f"{path}: records={st['integrity']['records']} "
                   f"odr={st['timing']['measured_odr_hz']} "
+                  f"host={st['timing']['host_rate_hz']} "
                   f"lost={st['integrity']['device_lost_pkt_delta']} "
                   f"gaps={st['integrity']['missing_blocks']} "
+                  f"short={st['integrity']['short_blocks']} "
                   f"clip={st['integrity']['clip_records']} "
                   f"ok={st['ok']}")
         else:

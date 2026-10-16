@@ -185,7 +185,7 @@ def case_clean(tmp, nrec, label):
           % (tm["tmst_out_of_window"], tm["tmst_gap"], tm["tmst_breaks"]))
     check(tm["measured_odr_hz"] is not None
           and abs(tm["measured_odr_hz"] - 8000.0) < 1.0,
-          "实测 ODR ≈ 8000 Hz（实际 %s）" % tm["measured_odr_hz"])
+          "标称时基换算速率 ≈ 8000 Hz（实际 %s）" % tm["measured_odr_hz"])
     check(tm["measured_odr_hz_diagnostic"] is None, "可信文件不产生「诊断 rate」")
     check(vals == [117, 118], "独立复算：Δ 只有 117/118 两种步长（实际 %s）" % vals)
     check(wraps > 0, "独立复算：raw 序列经历了 %d 次 16 位回绕" % wraps)

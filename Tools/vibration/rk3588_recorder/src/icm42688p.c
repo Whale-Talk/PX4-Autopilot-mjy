@@ -381,7 +381,11 @@ size_t icm_parse_fifo(const uint8_t *raw, size_t nbytes, vib_record_t *out,
         r.gyro[0]  = (int16_t)(((uint16_t)f[7] << 8) | (uint16_t)f[8]);
         r.gyro[1]  = (int16_t)(((uint16_t)f[9] << 8) | (uint16_t)f[10]);
         r.gyro[2]  = (int16_t)(((uint16_t)f[11] << 8) | (uint16_t)f[12]);
-        r.temp_raw = f[13];
+        r.temp_raw = f[13];               /* **原样保存 uint8 字节**（v3 布局/CRC 不变）。
+                                           * 物理温度须按有符号 8 位二补码解释后再套
+                                           * T = TEMP_DATA/2.07 + 25（手册 p.25/p.66）；
+                                           * 解析侧见 bin_reader.temp_raw_to_c。这里不改
+                                           * 六轴/ODR/滤波/量程，也不据温度字节置 flag。 */
         r.tmst_raw = (uint16_t)(((uint16_t)f[14] << 8) | (uint16_t)f[15]);
 
         if (h & ICM_FIFO_HDR_ODR_ACCEL)
@@ -486,8 +490,13 @@ int icm_selftest(icm_t *d, char *report, size_t n)
         fail = 1;
     }
 
-    /* ---- 采样时间戳校验：raw Δ 必须落在正常窗口（名义 117/118，含 ±1% PLL 容差
-     *      ⇒ 116..119），绝不是 125（那是「把 raw ticks 当 µs」的旧错误口径） ---- */
+    /* ---- 采样时间戳校验：raw Δ 必须落在正常窗口（名义 117/118 交替）。窗口
+     *      [115,120] 是**现选用的保守诊断门限**（名义附近抖动 vs 漏样本），
+     *      integer fixture 以名义附近整数偏移覆盖测试。⚠️ 不得由它反推时钟容差：
+     *      绝对钟差（表 4 的 ±1.5%、p.24 §4.10 的 ±1%，条件不同）**不能**直接
+     *      等同同一芯片内相邻 raw Δ 的变化；绝对时钟误差须靠外部参考
+     *      （host_rate_hz）判定，也不得据此声明绝对物理 ODR 已校准。窗口绝不是
+     *      125（那是「把 raw ticks 当 µs」的旧错误口径）。 ---- */
     if (nrec < 8) {
         APP("[自检] 记录数不足（%d），无法校验时间戳 ❌\n", nrec);
         return -1;
@@ -522,7 +531,8 @@ int icm_selftest(icm_t *d, char *report, size_t n)
             median_raw, VIB_TMST_RAW_LO, VIB_TMST_RAW_HI);
         fail = 1;
     } else {
-        APP("[自检] raw Δ 符合 8 kHz 预期（≈%.1f µs → 实测 ODR ≈ %.1f Hz）✅\n",
+        APP("[自检] raw Δ 符合 8 kHz 预期（≈%.1f µs → 标称时基换算速率 ≈ %.1f Hz；"
+            "芯片内部标称时基，未做绝对时钟校准）✅\n",
             (double)median_raw * (double)VIB_TMST_SCALE_NUM / (double)VIB_TMST_SCALE_DEN,
             tmst_accum_rate_hz(&ta));
     }

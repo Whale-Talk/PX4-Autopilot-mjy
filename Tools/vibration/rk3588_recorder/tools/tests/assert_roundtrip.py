@@ -62,7 +62,9 @@ def expected_values(seconds, clip_every):
         "az_g": 2048 / br.LSB_PER_G,
         "gx_dps": 164 / br.LSB_PER_DPS,
         "gz_dps": -16 / br.LSB_PER_DPS,
-        "temp_c": 21 / 2.07 + 25.0,
+        # 与 mk_synth.c 一致：temp_raw 存**原始 uint8 字节 0xF9**，物理温度按有符号
+        # 8 位二补码解释（0xF9 → −7），再套 T = TEMP_DATA/2.07 + 25（手册 p.25/p.66）。
+        "temp_c": br.temp_raw_to_c(0xF9),
         "blocks": (nrec + br.SAMPLES_PER_BLOCK - 1) // br.SAMPLES_PER_BLOCK,
     }
 
@@ -107,7 +109,8 @@ def main():
     # ---- 时间基准 ----
     check(tm["tmst_median_raw"] == 117, "raw Δ 中位 == 117（不是 125）",
           f"(实际 {tm['tmst_median_raw']})")
-    check(abs(tm["measured_odr_hz"] - 8000.0) < 1.0, "实测 ODR ≈ 8000 Hz（总 ticks/总时间）",
+    check(abs(tm["measured_odr_hz"] - 8000.0) < 1.0,
+          "标称时基换算速率 ≈ 8000 Hz（总 ticks/总时间；非绝对实测）",
           f"(实际 {tm['measured_odr_hz']})")
     check(tm["tmst_out_of_window"] == 0, "raw Δ 无越窗（16 位回绕被正确展开）")
     # 独立复算：sum_raw = floor((nrec-1) * 125*30/32)，duration = sum_raw * 32/30 / 1e6
@@ -132,7 +135,8 @@ def main():
     check(close(ph["gz"]["mean"], exp["gz_dps"]),
           f"gz 均值 == {r4(exp['gz_dps'])} dps", f"(实际 {ph['gz']['mean']})")
     check(close(st["temp"]["mean"], exp["temp_c"]),
-          f"温度均值 == {r4(exp['temp_c'])} ℃", f"(实际 {st['temp']['mean']})")
+          f"温度均值（uint8 字节按二补码解释）== {r4(exp['temp_c'])} ℃",
+          f"(实际 {st['temp']['mean']})")
     check(close(ph["ax"]["peak"], 32767 / br.LSB_PER_G),
           "ax 峰值 == 32767 LSB")
     check(close(ph["ax"]["min"], 1000 / br.LSB_PER_G),

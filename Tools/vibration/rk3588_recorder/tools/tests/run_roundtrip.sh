@@ -123,7 +123,7 @@ PYTHONPATH="$ROOT/tools:$VIBDIR" python3 "$TESTS/assert_tmst_gap.py"
 echo "--- 14) 映射导出仅包含已拟合段；允许误差不等于实机相位证据 ---"
 PYTHONPATH="$ROOT/tools:$VIBDIR" python3 "$TESTS/mapped_segment_test.py"
 
-echo "--- 15) 规格内 ODR 偏移（±1% PLL）不得判缺口/不可信：C 侧反例（生产 tmst.c）---"
+echo "--- 15) 名义附近整数时基偏移（现选用的保守诊断门限）不得判缺口/不可信：C 侧反例（生产 tmst.c）---"
 gcc -O2 -Wall -Wextra -Wshadow -Wconversion -Werror -std=gnu11 -I"$SRC" \
     -o "$OUT/tmst_tol" "$SRC/tests/tmst_tolerance_test.c" "$SRC/tmst.c"
 "$OUT/tmst_tol"
@@ -133,6 +133,9 @@ PYTHONPATH="$ROOT/tools:$VIBDIR" python3 "$TESTS/assert_tmst_tolerance.py"
 
 echo "--- 17) legacy v2（raw=µs 旧假设）必须被同步工具在读 ULog 前拒绝 ---"
 PYTHONPATH="$ROOT/tools:$VIBDIR" python3 "$TESTS/assert_legacy_refused.py"
+
+echo "--- 18) 独立字节 fixture：温度二补码 / 短读=notice / 真实错误仍失败 / 时基元数据 ---"
+PYTHONPATH="$ROOT/tools:$VIBDIR" python3 "$TESTS/assert_hw_bytes.py"
 
 echo
 echo "ROUNDTRIP-ALL-OK ✅"

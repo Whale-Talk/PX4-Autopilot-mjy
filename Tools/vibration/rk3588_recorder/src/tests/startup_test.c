@@ -293,6 +293,45 @@ static void mk_args(vib_run_args_t *a, spi_dev_t *spi, const char *outdir)
 
 static spi_dev_t g_spi;
 
+/* 运行日志（.run.json）可用性：所有 "{filename}.run.json" 中
+ *   - braces 配平、无 NUL 以外的非法字节
+ *   - 必须带机器可读时基元数据：kind=chip_nominal_scale、absolute_clock_calibrated=false
+ *     （不得宣称绝对时钟已校准）、tmst_scale 32/30、raw 窗口 [115,120]
+ *   - 必须带 notices（短读=信息级，不是异常）
+ * 只做结构/契约检查，不引入 JSON 依赖。 */
+static int runjson_selfcheck(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return -1;
+    char buf[16384];
+    const size_t rd = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[rd] = '\0';
+
+    int depth = 0, neg = 0;
+    for (size_t i = 0; i < rd; i++) {
+        if (buf[i] == '{') depth++;
+        else if (buf[i] == '}') { depth--; if (depth < 0) return -2; }
+    }
+    if (depth != 0)
+        return -2;
+    (void)neg;
+
+    static const char *need[] = {
+        "\"timebase\"", "\"kind\": \"chip_nominal_scale\"",
+        "\"absolute_clock_calibrated\": false",
+        "\"tmst_scale_num\": 32", "\"tmst_scale_den\": 30",
+        "\"raw_delta_window_lo\": 115", "\"raw_delta_window_hi\": 120",
+        "\"notices\"", "\"short_read\"", "\"short_read_blocks\"",
+    };
+    for (size_t i = 0; i < sizeof(need) / sizeof(need[0]); i++) {
+        if (!strstr(buf, need[i]))
+            return -3;
+    }
+    return 0;
+}
+
 static int run_healthy(char *out, uint32_t max_drains, uint32_t *lost_out)
 {
     g_reset();
@@ -323,6 +362,11 @@ int main(void)
         snprintf(p, sizeof(p), "%s/startup_test.bin", dir);
         CHECK(file_size(p) > (long)(VIB_HEADER_SIZE + VIB_BLOCK_HEADER_SIZE),
               "健康采集产生含数据块的文件（%ld B）", file_size(p));
+        snprintf(p, sizeof(p), "%s/startup_test.run.json", dir);
+        const int jrc = runjson_selfcheck(p);
+        CHECK(jrc == 0,
+              "健康采集的 .run.json 结构/时基契约通过（braces 配平 + timebase 未校准声明 + 32/30 + 窗口[115,120] + notices，rc=%d）",
+              jrc);
     }
 
     printf("== 2) 自检失败默认中止（不留文件）==\n");
